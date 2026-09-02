@@ -10,9 +10,9 @@ REAL_PROVIDERS_DIR = REPO_ROOT / "providers"
 
 
 class LoadRealProvidersTest(unittest.TestCase):
-    def test_loads_ci_and_kourier(self):
+    def test_loads_ci(self):
         providers = load_providers(REAL_PROVIDERS_DIR)
-        self.assertEqual(set(providers), {"ci", "kourier"})
+        self.assertEqual(set(providers), {"ci"})
 
     def test_ci_fields(self):
         ci = load_provider(REAL_PROVIDERS_DIR, "ci")
@@ -24,12 +24,6 @@ class LoadRealProvidersTest(unittest.TestCase):
         self.assertIsInstance(ci.concurrency_limit, int)
         self.assertTrue(ci.active)
         self.assertIn("/v1/messages", ci.request_shape.get("paths", []))
-
-    def test_kourier_fields(self):
-        kourier = load_provider(REAL_PROVIDERS_DIR, "kourier")
-        self.assertEqual(kourier.id, "kourier")
-        self.assertEqual(kourier.endpoint, "https://kourier.sh/")
-        self.assertFalse(kourier.active)
 
     def test_missing_provider_raises_key_error(self):
         with self.assertRaises(KeyError):
