@@ -1,0 +1,10 @@
+{
+  "id": "kourier",
+  "display_name": "kourier.sh",
+  "endpoint": "https://kourier.sh/",
+  "concurrency_limit": 1,
+  "client": "TBD",
+  "active": false,
+  "request_shape": {},
+  "timeout_overrides": {}
+}
