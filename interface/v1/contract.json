@@ -35,7 +35,7 @@
 
   "scheduling_model": {
     "model": "submitted-request-fifo",
-    "description": "Requests are served strictly in the order they are submitted to AALP, globally, independent of which logical flow/caller/agent submitted them. There is no round robin, no priority, no per-agent fairness, and no idle reservation of a future request's turn.",
+    "description": "Requests targeting the same provider are served strictly in the order they are submitted to that provider, independent of which logical flow/caller/agent submitted them. There is no round robin, no priority, no per-agent fairness, and no idle reservation of a future request's turn. This ordering guarantee is per-provider, not a single global queue: different providers' requests may execute concurrently, and once a provider's concurrency_limit is greater than 1, that provider's own requests may too (see concurrency_bound below) -- FIFO order applies among requests contending for the same provider slot(s), not as a system-wide single-flight bottleneck.",
     "flow_id": {
       "field": "X-Aalp-Flow-Id request header (request.forward only)",
       "required": false,
@@ -58,7 +58,7 @@
         "response_status_code": 503
       },
       "queue_timeout": {
-        "meaning": "The request could not be admitted (FIFO scheduling admission, or provider lane admission) before its queue-timeout budget elapsed. No upstream network attempt was made.",
+        "meaning": "The request could not be admitted into its target provider's own FIFO lane before its queue-timeout budget elapsed. No upstream network attempt was made.",
         "response_status_code": 504
       },
       "compression_timeout": {

@@ -3,8 +3,8 @@
 Reimplements the *interface shape* described in contract.json from scratch,
 using only the Python standard library. It never imports the `aalp` package
 or reads any AALP-private on-disk state, so a client test built against this
-fake stays correct even if AALP's real internals (Gateway, Lane,
-FlowAdmission, ...) are completely rewritten.
+fake stays correct even if AALP's real internals (Gateway, Lane, ...) are
+completely rewritten.
 
 Two layers are provided:
 

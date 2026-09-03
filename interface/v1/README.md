@@ -8,12 +8,12 @@ human-readable explanation of the same contract.
 
 ## Why this exists
 
-AALP's real implementation (`aalp/lane.py`, `flow.py`, `credential.py`,
+AALP's real implementation (`aalp/lane.py`, `credential.py`,
 `errors.py`, `forwarder.py`, `ingress.py`, `audit.py`, `migrate_ci.py`,
 `gateway.py`) is provider-agnostic, socket-aware where it needs to be, and
 free to change its internals at any time. A client built against those
-private modules — importing them directly, instantiating `Gateway`, `Lane`,
-or `FlowAdmission`, calling an undocumented function, or reading `.aalp/`
+private modules — importing them directly, instantiating `Gateway` or
+`Lane`, calling an undocumented function, or reading `.aalp/`
 private state on disk — would be coupled to implementation details that were
 never meant to be a contract. Interface v1 exists so a conforming fake AALP
 service can be built and tested against *this document alone*, and so ACP's
@@ -103,7 +103,7 @@ would require a new major interface version instead.
 |---|---|---|
 | `success` | Upstream response read back completely; its own status code is passed through as-is. | passthrough |
 | `unavailable` | Provider id unknown or `active: false`. No network attempt was made. | 503 |
-| `queue_timeout` | Admission (request FIFO or provider lane) did not complete before its queue-timeout budget elapsed. No network attempt was made. | 504 |
+| `queue_timeout` | Admission into the target provider's own FIFO lane did not complete before its queue-timeout budget elapsed. No network attempt was made. | 504 |
 | `compression_timeout` | A connection-level timeout occurred while sending the request or reading the response, once an upstream attempt started. | 504 |
 | `total_timeout` | The overall queue+upstream timeout budget elapsed, whether or not an upstream attempt ever started. | 504 |
 | `invalid_response` | A connection was established but the response could not be read as well-formed HTTP. | 502 |
@@ -115,17 +115,14 @@ are not modeled with this enum; they use ordinary HTTP 200/404 semantics
 
 ## Scheduling: submitted-request FIFO
 
-This is the one area where interface v1 describes something stricter than
-what today's `aalp/gateway.py` and `aalp/flow.py` actually do — a separate,
-concurrent fix is bringing the implementation in line with this section, and
-this is the target model a conforming fake service (and, once landed, the
-real service) must implement:
-
-- Requests are served strictly in the order they are **submitted** to AALP,
-  globally — across every logical flow, caller, and agent. There is no
-  round robin, no priority, no per-agent fairness, and critically, no way to
-  reserve a lane slot ahead of actually submitting the request that will use
-  it.
+- Requests targeting the same provider are served strictly in the order
+  they are **submitted** to that provider — across every logical flow,
+  caller, and agent. There is no round robin, no priority, no per-agent
+  fairness, and critically, no way to reserve a lane slot ahead of
+  actually submitting the request that will use it. This is a per-provider
+  guarantee, not a single global queue: it holds among requests contending
+  for the same provider's slot(s), not as a system-wide bottleneck across
+  unrelated providers.
 - A request may optionally carry an `X-Aalp-Flow-Id` header purely as an
   **audit/grouping label**. It has zero effect on scheduling order. Two
   requests sharing a `flow_id` are not guaranteed to run adjacently, and a
@@ -134,16 +131,21 @@ real service) must implement:
 - **There is no renewal operation in this interface.** Earlier AALP builds
   had an open-ended per-flow reservation (`X-Aalp-Flow-Token`, renewed
   across a flow's successive requests) that let an idle flow hold a lane
-  slot open for a not-yet-submitted continuation request. That mechanism is
-  being removed; interface v1 was written to describe its replacement, not
-  its past behavior, and no future v1.x addition may reintroduce an
+  slot open for a not-yet-submitted continuation request. That mechanism
+  has been removed, and no future v1.x addition may reintroduce an
   equivalent reservation without a new major version.
-- Provider concurrency is still bounded by each provider's declared
-  `concurrency_limit` (discoverable via `provider.status`); the default `ci`
-  provider is `concurrency_limit: 1` — single-flight, unchanged from before.
-  FIFO order and the concurrency ceiling are independent constraints: FIFO
-  governs the order requests are attempted in, the ceiling governs how many
-  may be in flight upstream at once.
+- Provider concurrency is bounded by each provider's declared
+  `concurrency_limit` (discoverable via `provider.status`) — and that
+  bound is the *only* thing that gates it: a provider's own concurrency
+  ceiling determines how many of its own requests genuinely run at once,
+  with no separate global admission step narrowing it further. The
+  default `ci` provider is `concurrency_limit: 1` — single-flight, as
+  before — but a provider declared with a higher limit, or a second
+  provider entirely, now executes concurrently rather than being
+  serialized behind `ci`'s own requests. FIFO order and the concurrency
+  ceiling are independent constraints: FIFO governs the order a given
+  provider's requests are attempted in, the ceiling governs how many of
+  that provider's requests may be in flight upstream at once.
 
 ## What this interface explicitly does not cover
 
@@ -156,11 +158,11 @@ be given, a path to a provider credential.
 
 More generally: a conforming client only ever calls the three HTTP
 operations documented above and in `contract.json`. It never imports an
-`aalp.*` Python module, never instantiates `Gateway`, `Lane`, or
-`FlowAdmission`, never calls a function not named on this page, and never
-reads `.aalp/` state from disk. If a future need can't be met through this
-interface, the fix is to extend the interface (additively, if possible),
-not to reach around it.
+`aalp.*` Python module, never instantiates `Gateway` or `Lane`, never
+calls a function not named on this page, and never reads `.aalp/` state
+from disk. If a future need can't be met through this interface, the fix
+is to extend the interface (additively, if possible), not to reach
+around it.
 
 ## Compatibility rules
 

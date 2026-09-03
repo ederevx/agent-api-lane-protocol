@@ -13,12 +13,6 @@ narrow surface (`set_providers`, `program_success`, `capabilities`,
 bodies and is deliberately not a `unittest.TestCase` subclass so it is
 never collected/run on its own.
 
-Scope note: every scheduling test here uses `concurrency_limit=1` (the
-same value the real "ci" provider uses in production), matching
-contract.json's own worked example. That is a deliberate limitation, not
-an oversight -- see the module-level comment above
-`test_concurrency_limit_one_serializes_submitted_requests_in_order` for
-why concurrency_limit > 1 is not exercised here.
 """
 from __future__ import annotations
 
@@ -374,19 +368,6 @@ class ConformanceMixin:
         # §35 acceptance #1/#3, proven identically against both backends:
         # a concurrency_limit=1 provider genuinely serializes two
         # submitted requests in the order they were submitted.
-        #
-        # Deliberately concurrency_limit=1 only (matching the real "ci"
-        # provider and contract.json's own worked example): the real
-        # Gateway's flow admission is a single shared, request-scoped
-        # Lane(capacity=1) held for a request's *entire* lifecycle
-        # (aalp/flow.py's FlowAdmission), so today at most one request is
-        # ever in flight through the real service at all, system-wide,
-        # independent of any provider's own declared concurrency_limit.
-        # The fake's per-provider lane has no such global gate and *will*
-        # run N requests concurrently for a concurrency_limit=N provider.
-        # That is a genuine real-vs-fake behavioral difference outside
-        # this suite's scope to adjudicate -- reported separately rather
-        # than asserted here either way.
         self.driver.set_providers([
             {"id": "prov", "display_name": "Prov", "concurrency_limit": 1,
              "accepted_paths": ["/v1/messages"]},
@@ -396,6 +377,53 @@ class ConformanceMixin:
             "prov", "/v1/messages", [("A", "flow-1"), ("B", "flow-2")])
 
         self.assertEqual(order, ["A", "B"])
+
+    def test_concurrency_limit_above_one_allows_genuine_concurrent_execution(
+        self,
+    ) -> None:
+        # A provider's own concurrency_limit is the only thing that
+        # should gate how many of its requests run at once (contract.json
+        # scheduling_model.concurrency_bound) -- proven identically
+        # against both backends by observing both requests actually
+        # in flight together, not serialized behind anything wider.
+        self.driver.set_providers([
+            {"id": "prov", "display_name": "Prov", "concurrency_limit": 2,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+        self.driver.program_success("prov", "/v1/messages", body=b"A", delay=0.2)
+        self.driver.program_success("prov", "/v1/messages", body=b"B", delay=0.2)
+
+        results = {}
+
+        def submit(marker: str) -> None:
+            results[marker] = self.driver.forward(
+                "prov", "POST", "/v1/messages", flow_id=f"flow-{marker}")
+
+        threads = [
+            threading.Thread(target=submit, args=(marker,))
+            for marker in ("A", "B")
+        ]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + 2.0
+        observed_both_in_flight = False
+        while time.monotonic() < deadline:
+            _, payload = self.driver.provider_status("prov")
+            if payload["in_flight"] == 2:
+                observed_both_in_flight = True
+                break
+            time.sleep(0.01)
+
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(
+            observed_both_in_flight,
+            "expected both concurrency_limit=2 requests to run at the "
+            "same time instead of being serialized")
+        self.assertEqual(results["A"][0], 200)
+        self.assertEqual(results["B"][0], 200)
 
     def test_completing_earlier_flows_request_leaves_no_idle_reservation(self) -> None:
         # §35 acceptance #2, explicit: completion of A1 (flow-A) must

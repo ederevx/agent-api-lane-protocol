@@ -228,10 +228,6 @@ class TotalTimeoutTest(_TempGatewayCase):
         self.assertEqual(result.outcome, Outcome.TOTAL_TIMEOUT)
         self.assertEqual(
             gateway.provider_lanes["prov"].status()["leased"], 0)
-        # The flow lease is released unconditionally once admitted, even
-        # on this early-return path, so the next submitted request is
-        # never left waiting on it.
-        self.assertEqual(gateway.flows.status()["leased"], 0)
 
 
 class QuarantineTest(_TempGatewayCase):
@@ -283,7 +279,7 @@ class ConfirmedCloseTest(_TempGatewayCase):
 
 
 class UnavailableProviderTest(_TempGatewayCase):
-    def test_unknown_provider_is_unavailable_but_flow_admission_still_happens(
+    def test_unknown_provider_returns_unavailable_without_a_lane(
         self,
     ) -> None:
         _write_provider(self.providers_dir, "prov", concurrency_limit=1)
@@ -327,10 +323,11 @@ class AuditBlindnessTest(_TempGatewayCase):
 
 
 class SubmittedRequestFifoOrderTest(_TempGatewayCase):
-    """Direct acceptance tests for request-scoped flow admission: flow
-    admission is a single shared FIFO lane, admitted fresh and released
-    unconditionally on every request, so requests execute in strict
-    submission order regardless of which flow they belong to."""
+    """Direct acceptance tests for per-provider FIFO ordering: a
+    concurrency_limit=1 provider's own Lane admits fresh and releases
+    unconditionally on every request, so requests targeting it execute
+    in strict submission order regardless of which flow they belong
+    to — with no separate global admission gate involved."""
 
     def _assert_fifo_execution_order(self, submissions) -> None:
         """`submissions`: [(marker, flow_id), ...] in submission order."""
@@ -375,11 +372,12 @@ class SubmittedRequestFifoOrderTest(_TempGatewayCase):
             thread.start()
             threads.append(thread)
             if index == 0:
-                _wait_until(lambda: gateway.flows.status()["leased"] == 1)
+                _wait_until(
+                    lambda: gateway.provider_lanes["prov"].status()["leased"] == 1)
             else:
                 _wait_until(
                     lambda expected=index:
-                        gateway.flows.status()["queued"] == expected)
+                        gateway.provider_lanes["prov"].status()["queued"] == expected)
 
         block_first.set()
         for thread in threads:
