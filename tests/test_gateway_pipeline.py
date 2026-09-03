@@ -437,17 +437,28 @@ class IngressAdapterTest(_TempGatewayCase):
         self.assertEqual(provider_id, "prov")
         self.assertEqual(path, "/v1/messages")
 
-    def test_missing_flow_id_header_returns_400_without_calling_handle(self) -> None:
-        def never_called(*args, **kwargs):
-            raise AssertionError("handle() must not be called")
+    def test_missing_flow_id_header_synthesizes_one_and_still_calls_handle(
+        self,
+    ) -> None:
+        # interface/v1/contract.json's scheduling_model.flow_id is
+        # optional — a caller that omits X-Aalp-Flow-Id must still be
+        # served, with an opaque grouping label synthesized in its place.
+        calls = []
 
-        self.gateway.handle = never_called
+        def fake_handle(flow_id, provider_id, method, path, headers, body):
+            calls.append(flow_id)
+            return AalpResult(Outcome.SUCCESS, status_code=200, body=b"ok")
+
+        self.gateway.handle = fake_handle
         adapter = self.gateway.as_ingress_handler()
 
-        status, _headers, _body = adapter(
+        status, _headers, body = adapter(
             "POST", "/prov/v1/messages", {}, b"{}")
 
-        self.assertEqual(status, 400)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"ok")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0])
 
     def test_non_success_outcome_maps_to_ingress_status(self) -> None:
         def fake_handle(flow_id, provider_id, method, path, headers, body):

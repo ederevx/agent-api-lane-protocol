@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -378,9 +379,14 @@ class Gateway:
             provider_id, _, rest = path.lstrip("/").partition("/")
             forwarded_path = "/" + rest
 
-            flow_id = _header(headers, "X-Aalp-Flow-Id")
-            if not flow_id:
-                return 400, {}, b"missing X-Aalp-Flow-Id header"
+            # interface/v1/contract.json's scheduling_model.flow_id is
+            # optional: it is a pure audit/grouping label with no
+            # scheduling authority, so a caller that omits it must still
+            # be served — synthesize an opaque one rather than reject
+            # the request. This only affects the audit-log grouping
+            # value; admission/ordering never depended on it even when
+            # the header was supplied.
+            flow_id = _header(headers, "X-Aalp-Flow-Id") or secrets.token_hex(16)
 
             result = self.handle(
                 flow_id, provider_id, method, forwarded_path, headers, body)
