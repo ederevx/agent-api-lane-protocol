@@ -38,8 +38,7 @@ def _default_root() -> str | None:
 def build_ingress(
     providers_dir: Path | None = None,
     root: str | Path | None = None,
-    host: str = "127.0.0.1",
-    port: int = 0,
+    socket_path: str | Path | None = None,
 ) -> Ingress:
     """Construct a `Gateway` and the `Ingress` that serves it.
 
@@ -52,8 +51,7 @@ def build_ingress(
     return Ingress(
         gateway.as_ingress_handler(),
         root=root if root is not None else _default_root(),
-        host=host,
-        port=port,
+        socket_path=socket_path,
     )
 
 
@@ -67,21 +65,20 @@ def main(argv: list[str] | None = None) -> int:
         "--root", type=str, default=None,
         help="AALP state root, i.e. where .aalp/ lives (default: AALP_HOME "
              "env var, else the current working directory).")
-    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument(
-        "--port", type=int, default=0,
-        help="0 (default) binds an OS-assigned ephemeral port, published "
-             "via .aalp/state/ingress.json for clients to discover.")
+        "--socket-path", type=str, default=None,
+        help="Unix socket path to bind (default: <root>/.aalp/state/"
+             "ingress.sock, published via .aalp/state/ingress.json for "
+             "clients to discover).")
     args = parser.parse_args(argv)
 
     ingress = build_ingress(
         providers_dir=args.providers_dir,
         root=args.root,
-        host=args.host,
-        port=args.port,
+        socket_path=args.socket_path,
     )
     ingress.start()
-    print(f"aalp: listening on {args.host}:{ingress.port}", file=sys.stderr)
+    print(f"aalp: listening on {ingress.socket_path}", file=sys.stderr)
 
     stop_event = threading.Event()
 

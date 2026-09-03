@@ -1,7 +1,9 @@
-import http.client
+import base64
 import json
 import os
+import socket
 import stat
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,7 @@ from pathlib import Path
 from aalp.ingress import Ingress, IngressError, load_or_create_secret
 
 _TIMEOUT = 2.0
+_LENGTH_PREFIX = struct.Struct(">I")
 
 
 class RecordingHandler:
@@ -24,6 +27,28 @@ class RecordingHandler:
         if self.raise_error:
             raise RuntimeError("boom: sensitive detail")
         return self.response
+
+
+def _recv_exact(sock, n):
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("peer closed before sending all expected bytes")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+class _Response:
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    def getheader(self, name, default=None):
+        return self.headers.get(name, default)
 
 
 class IngressRequestTest(unittest.TestCase):
@@ -46,31 +71,48 @@ class IngressRequestTest(unittest.TestCase):
         self.addCleanup(ingress.stop)
         return ingress
 
-    def _connection(self, ingress) -> http.client.HTTPConnection:
-        conn = http.client.HTTPConnection("127.0.0.1", ingress.port, timeout=_TIMEOUT)
-        self.addCleanup(conn.close)
-        return conn
+    def _raw_send(self, ingress, payload: bytes) -> _Response:
+        """Send a raw, already-framed payload and read back one framed
+        response. Used by tests that need to send something other than a
+        well-formed envelope (e.g. an oversized or malformed frame)."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(_TIMEOUT)
+        self.addCleanup(sock.close)
+        sock.connect(str(ingress.socket_path))
+        sock.sendall(payload)
+        header = _recv_exact(sock, _LENGTH_PREFIX.size)
+        (length,) = _LENGTH_PREFIX.unpack(header)
+        response_payload = _recv_exact(sock, length)
+        response = json.loads(response_payload.decode("utf-8"))
+        raw_body = response.get("body") or ""
+        body = base64.b64decode(raw_body) if raw_body else b""
+        return _Response(response["status"], dict(response.get("headers") or {}), body)
+
+    def _call(self, ingress, method, path, headers=None, body=b"") -> _Response:
+        envelope = json.dumps({
+            "method": method,
+            "path": path,
+            "headers": headers or {},
+            "body": base64.b64encode(body).decode("ascii") if body else "",
+        }).encode("utf-8")
+        return self._raw_send(ingress, _LENGTH_PREFIX.pack(len(envelope)) + envelope)
 
     def test_authorized_request_reaches_handler_and_echoes_response(self):
         handler = RecordingHandler(
             response=(201, {"X-Custom": "yes"}, b"created-body"))
         ingress = self._start_ingress(handler)
-        conn = self._connection(ingress)
 
-        conn.request(
-            "POST",
-            "/some/path",
-            body=b"hello",
+        response = self._call(
+            ingress, "POST", "/some/path",
             headers={
                 "Authorization": f"Bearer {self.secret}",
                 "Content-Type": "text/plain",
             },
+            body=b"hello",
         )
-        response = conn.getresponse()
-        body = response.read()
 
         self.assertEqual(response.status, 201)
-        self.assertEqual(body, b"created-body")
+        self.assertEqual(response.body, b"created-body")
         self.assertEqual(response.getheader("X-Custom"), "yes")
         self.assertEqual(len(handler.calls), 1)
         method, path, headers, received_body = handler.calls[0]
@@ -81,11 +123,8 @@ class IngressRequestTest(unittest.TestCase):
     def test_missing_authorization_header_returns_401_and_skips_handler(self):
         handler = RecordingHandler()
         ingress = self._start_ingress(handler)
-        conn = self._connection(ingress)
 
-        conn.request("POST", "/x", body=b"payload")
-        response = conn.getresponse()
-        response.read()
+        response = self._call(ingress, "POST", "/x", body=b"payload")
 
         self.assertEqual(response.status, 401)
         self.assertEqual(handler.calls, [])
@@ -93,45 +132,34 @@ class IngressRequestTest(unittest.TestCase):
     def test_wrong_bearer_token_returns_401_and_skips_handler(self):
         handler = RecordingHandler()
         ingress = self._start_ingress(handler)
-        conn = self._connection(ingress)
 
-        conn.request(
-            "POST", "/x", body=b"payload",
+        response = self._call(
+            ingress, "POST", "/x", body=b"payload",
             headers={"Authorization": "Bearer wrong-token"},
         )
-        response = conn.getresponse()
-        response.read()
 
         self.assertEqual(response.status, 401)
         self.assertEqual(handler.calls, [])
 
-    def test_oversized_content_length_returns_413_without_reading_body(self):
+    def test_oversized_frame_returns_413_without_reading_body(self):
         handler = RecordingHandler()
         ingress = self._start_ingress(handler, max_request_bytes=100)
-        conn = self._connection(ingress)
 
         oversized_body = b"x" * 1000
-        conn.request(
-            "POST", "/x", body=oversized_body,
+        response = self._call(
+            ingress, "POST", "/x", body=oversized_body,
             headers={"Authorization": f"Bearer {self.secret}"},
         )
-        response = conn.getresponse()
-        response.read()
 
         self.assertEqual(response.status, 413)
         self.assertEqual(handler.calls, [])
 
-    def test_missing_content_length_returns_400_and_skips_handler(self):
+    def test_malformed_envelope_returns_400_and_skips_handler(self):
         handler = RecordingHandler()
         ingress = self._start_ingress(handler)
-        conn = self._connection(ingress)
 
-        # Send a raw request line + headers with no Content-Length, no body.
-        conn.putrequest("POST", "/x", skip_host=False, skip_accept_encoding=False)
-        conn.putheader("Authorization", f"Bearer {self.secret}")
-        conn.endheaders()
-        response = conn.getresponse()
-        response.read()
+        payload = b"not valid json"
+        response = self._raw_send(ingress, _LENGTH_PREFIX.pack(len(payload)) + payload)
 
         self.assertEqual(response.status, 400)
         self.assertEqual(handler.calls, [])
@@ -139,32 +167,26 @@ class IngressRequestTest(unittest.TestCase):
     def test_handler_exception_returns_500_without_leaking_traceback_and_server_survives(self):
         handler = RecordingHandler(raise_error=True)
         ingress = self._start_ingress(handler)
-        conn = self._connection(ingress)
 
-        conn.request(
-            "POST", "/x", body=b"payload",
+        response = self._call(
+            ingress, "POST", "/x", body=b"payload",
             headers={"Authorization": f"Bearer {self.secret}"},
         )
-        response = conn.getresponse()
-        body = response.read()
 
         self.assertEqual(response.status, 500)
-        self.assertNotIn(b"boom", body)
-        self.assertNotIn(b"sensitive detail", body)
-        self.assertNotIn(b"Traceback", body)
+        self.assertNotIn(b"boom", response.body)
+        self.assertNotIn(b"sensitive detail", response.body)
+        self.assertNotIn(b"Traceback", response.body)
 
         # A second, well-formed request afterward still succeeds.
         handler.raise_error = False
-        conn2 = self._connection(ingress)
-        conn2.request(
-            "POST", "/y", body=b"payload2",
+        response2 = self._call(
+            ingress, "POST", "/y", body=b"payload2",
             headers={"Authorization": f"Bearer {self.secret}"},
         )
-        response2 = conn2.getresponse()
-        body2 = response2.read()
 
         self.assertEqual(response2.status, 200)
-        self.assertEqual(body2, b"ok")
+        self.assertEqual(response2.body, b"ok")
 
 
 class LoadOrCreateSecretTest(unittest.TestCase):
@@ -210,7 +232,7 @@ class IngressDescriptorTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
-    def test_start_writes_descriptor_with_bound_port_and_stop_shuts_down(self):
+    def test_start_writes_descriptor_with_bound_socket_and_stop_shuts_down(self):
         handler = RecordingHandler()
         ingress = Ingress(handler, root=self.root, secret="s3cr3t")
         ingress.start()
@@ -218,16 +240,19 @@ class IngressDescriptorTest(unittest.TestCase):
         descriptor_path = Path(self.root) / ".aalp" / "state" / "ingress.json"
         self.assertTrue(descriptor_path.is_file())
         descriptor = json.loads(descriptor_path.read_text())
-        self.assertEqual(descriptor["host"], "127.0.0.1")
-        self.assertEqual(descriptor["port"], ingress.port)
+        self.assertEqual(descriptor["socket_path"], str(ingress.socket_path))
         self.assertIn("secret_file", descriptor)
 
-        port = ingress.port
+        socket_path = ingress.socket_path
         ingress.stop()
 
-        with self.assertRaises((ConnectionRefusedError, OSError)):
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=_TIMEOUT)
-            conn.connect()
+        self.assertFalse(socket_path.exists())
+        with self.assertRaises(OSError):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(str(socket_path))
+            finally:
+                sock.close()
 
 
 if __name__ == "__main__":

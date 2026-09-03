@@ -21,30 +21,37 @@
   },
 
   "authentication": {
-    "mechanism": "single bearer secret over a loopback HTTP connection",
+    "mechanism": "single bearer secret over a loopback Unix domain socket",
     "notes": "AALP has exactly one authorized client per host (ACP). The bearer secret is transport/session bootstrap material, not a per-request credential, and is out of scope for this document's field-level schemas. It is never a provider credential and this interface never exposes provider credentials (see excluded_from_this_interface).",
     "bootstrap": {
       "summary": "How a client discovers where AALP is listening and what bearer secret to send, without reading any other AALP-private on-disk state.",
       "descriptor_file": {
         "path": "<AALP root>/.aalp/state/ingress.json",
         "aalp_root_resolution": "AALP_HOME environment variable if set, else the current working directory AALP was started from. A client must be told this root out-of-band (e.g. via shared deployment configuration); interface v1 defines no discovery operation for locating an unknown root.",
-        "format": { "host": "string, always 127.0.0.1", "port": "integer", "secret_file": "string, absolute path to the bearer secret file" },
+        "format": { "socket_path": "string, absolute filesystem path to the bound AF_UNIX socket", "secret_file": "string, absolute path to the bearer secret file" },
         "written": "atomically, by AALP's ingress on startup, before it begins accepting connections"
       },
       "secret_file": {
         "path": "named by descriptor_file's 'secret_file' field (default '<AALP root>/.aalp/state/ingress.secret')",
         "format": "opaque bearer token, raw bytes, no trailing newline guaranteed",
-        "permissions": "0600, owner-only, generated once by AALP and never transmitted except as the value clients send back in the Authorization header",
-        "usage": "sent as 'Authorization: Bearer <contents>' on every request.forward / provider.status / service.capabilities call"
+        "permissions": "0600, owner-only, generated once by AALP and never transmitted except as the value clients send back inside the request envelope's Authorization header field",
+        "usage": "sent as 'Authorization: Bearer <contents>' (a field inside the JSON request envelope, not an HTTP header) on every request.forward / provider.status / service.capabilities call"
       },
-      "carve_out_rationale": "These two files exist specifically so a cross-protocol client can bootstrap a connection without a hardcoded port or a pre-shared secret out-of-band. They are the one deliberate, narrow exception to the 'never read another protocol's private state' rule (adjustment metadata §4): a client may read exactly these two paths, for exactly this purpose, and must not read or infer anything else from '.aalp/' state. Everything else under '.aalp/' (credentials, audit log, provider lane internals) remains off-limits."
+      "carve_out_rationale": "These two files exist specifically so a cross-protocol client can bootstrap a connection without a hardcoded socket path or a pre-shared secret out-of-band. They are the one deliberate, narrow exception to the 'never read another protocol's private state' rule (adjustment metadata §4): a client may read exactly these two paths, for exactly this purpose, and must not read or infer anything else from '.aalp/' state. Everything else under '.aalp/' (credentials, audit log, provider lane internals) remains off-limits."
     }
   },
 
   "transport_binding": {
     "normative_for": "request.forward",
     "informative_for": ["provider.status", "service.capabilities"],
-    "notes": "request.forward's binding below is AALP's existing, already-implemented wire protocol and is normative: a conforming AALP service and a conforming fake service used for ACP client tests must both implement it exactly as described. provider.status and service.capabilities are new discovery operations required by this interface; the HTTP paths given below are the concrete binding a fake service and the real AALP service must both implement, but a different transport (e.g. a local IPC form) could replace them in a later interface_version without changing the operation names, fields, or outcome semantics documented here.",
+    "notes": "request.forward's binding below is AALP's existing, already-implemented wire protocol and is normative: a conforming AALP service and a conforming fake service used for ACP client tests must both implement it exactly as described. provider.status and service.capabilities are new discovery operations required by this interface; the method/path pairs given below are the concrete binding a fake service and the real AALP service must both implement, but a different transport encoding could replace the envelope format in a later interface_version without changing the operation names, fields, or outcome semantics documented here.",
+    "wire_protocol": {
+      "socket": "AF_UNIX, SOCK_STREAM, bound at the path published in the bootstrap descriptor",
+      "framing": "Each connection carries exactly one request and one response, then closes. A request or response is one frame: a 4-byte big-endian unsigned length prefix, followed by that many bytes of UTF-8-encoded JSON.",
+      "request_envelope": { "method": "string, e.g. 'GET' or 'POST'", "path": "string, e.g. '/_aalp/v1/capabilities' or '/{provider_id}/{upstream_path}'", "headers": "object of string to string, includes 'Authorization' and, for request.forward, optionally 'X-Aalp-Flow-Id'", "body": "string, base64-encoded request body bytes (empty string if there is no body)" },
+      "response_envelope": { "status": "integer, an HTTP-style status code", "headers": "object of string to string, includes 'X-Aalp-Outcome' for request.forward responses", "body": "string, base64-encoded response body bytes (empty string if there is no body)" },
+      "deadline_handling": "AALP's ingress imposes no read/write deadline of its own; all queue_timeout/compression_timeout/total_timeout budget enforcement is the client's responsibility, tracked as a single cumulative deadline across however many individual socket reads/writes one call takes -- never a single per-syscall timeout, which cannot bound a multi-syscall read."
+    },
     "reserved_path_prefix": "_aalp",
     "reserved_path_prefix_rule": "No provider id may begin with '_'. This keeps discovery paths under /_aalp/v1/... from ever colliding with request.forward's /{provider_id}/... passthrough paths."
   },
@@ -99,7 +106,7 @@
   "operations": {
     "service.capabilities": {
       "summary": "Discover AALP's interface version and capability set.",
-      "http_binding": { "method": "GET", "path": "/_aalp/v1/capabilities" },
+      "binding": { "method": "GET", "path": "/_aalp/v1/capabilities" },
       "request": {
         "type": "object",
         "properties": {},
@@ -125,7 +132,7 @@
 
     "provider.status": {
       "summary": "Discover provider availability, concurrency state, and accepted request shape, so a client never needs to read providers/*.json directly.",
-      "http_binding": {
+      "binding": {
         "list": { "method": "GET", "path": "/_aalp/v1/providers" },
         "single": { "method": "GET", "path": "/_aalp/v1/providers/{provider_id}" }
       },
@@ -199,7 +206,7 @@
 
     "request.forward": {
       "summary": "Submit one provider request and receive a documented outcome. The only operation that talks to a provider's upstream API.",
-      "http_binding": {
+      "binding": {
         "method": "any (forwarded verbatim to the provider)",
         "path": "/{provider_id}/{upstream_path}",
         "path_notes": "The first '/'-delimited path segment names the target provider id and is stripped before forwarding; everything after it must exactly match one of that provider's accepted_paths (see provider.status)."

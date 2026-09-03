@@ -27,24 +27,46 @@ available through `provider.status`.
 
 ## Bootstrap: discovering AALP and authenticating
 
-Every operation below requires a live loopback HTTP connection to AALP and a
-bearer secret. A client discovers both the same way, and this is the one
-deliberate, narrow exception to "never read another protocol's private
-state": these two files, and only these two files, are a published part of
-interface v1, carved out of `.aalp/` specifically for this purpose
+Every operation below requires a live loopback Unix-domain-socket connection
+to AALP and a bearer secret. A client discovers both the same way, and this
+is the one deliberate, narrow exception to "never read another protocol's
+private state": these two files, and only these two files, are a published
+part of interface v1, carved out of `.aalp/` specifically for this purpose
 (adjustment metadata §4).
 
 - **`<AALP root>/.aalp/state/ingress.json`** — written atomically by AALP's
   ingress on startup, before it accepts any connection. Contains
-  `{"host": "127.0.0.1", "port": <int>, "secret_file": "<absolute path>"}`.
+  `{"socket_path": "<absolute path>", "secret_file": "<absolute path>"}`.
   `<AALP root>` resolves to the `AALP_HOME` environment variable if set,
   else the working directory AALP was started from; a client must be told
   this root out-of-band (shared deployment configuration) — interface v1
   defines no operation for locating an unknown root.
 - **`<secret_file>`** (default `<AALP root>/.aalp/state/ingress.secret`) —
   an opaque bearer token, `0600`, owner-only, generated once. A client
-  reads its raw contents and sends them back as
-  `Authorization: Bearer <contents>` on every request below.
+  reads its raw contents and sends them back as the request envelope's
+  `Authorization: Bearer <contents>` header field on every request below.
+
+### Wire protocol
+
+Interface v1 speaks a minimal length-prefixed JSON protocol over
+`AF_UNIX`, not HTTP: each connection carries exactly one request and one
+response, then closes. A request or response is one frame — a 4-byte
+big-endian unsigned length prefix, followed by that many bytes of
+UTF-8-encoded JSON:
+
+```
+request:  {"method": str, "path": str, "headers": {str: str}, "body": <base64 str>}
+response: {"status": int, "headers": {str: str}, "body": <base64 str>}
+```
+
+`method`/`path` below still describe each operation's binding exactly the
+way an HTTP verb and path would — they are just envelope fields now, not a
+literal HTTP request line. `body` is base64-encoded so it can carry
+arbitrary, non-UTF8-safe bytes (a passthrough provider request/response
+body) safely inside JSON. AALP's ingress imposes no read/write deadline of
+its own; all budget enforcement (`queue_timeout`/`compression_timeout`/
+`total_timeout`) is the client's responsibility, tracked as one cumulative
+deadline across however many individual socket reads/writes a call takes.
 
 A client reads exactly these two paths and nothing else under `.aalp/`.
 Credentials, the audit log, and provider-lane internals remain off-limits in
@@ -54,7 +76,8 @@ every version of this interface.
 
 ### `service.capabilities`
 
-`GET /_aalp/v1/capabilities` → `{"service": "aalp", "interface_version": 1, "capabilities": [...]}`
+`GET /_aalp/v1/capabilities` (an envelope `method`/`path` pair, per the wire
+protocol above, not a literal HTTP request) → `{"service": "aalp", "interface_version": 1, "capabilities": [...]}`
 
 The discovery entry point. A client should call this first (and may cache
 the result) to learn AALP's interface version and which capability strings
@@ -131,11 +154,11 @@ would require a new major interface version instead.
 | `queue_timeout` | Admission into the target provider's own FIFO lane did not complete before its queue-timeout budget elapsed. No network attempt was made. | 504 |
 | `compression_timeout` | A connection-level timeout occurred while sending the request or reading the response, once an upstream attempt started. | 504 |
 | `total_timeout` | The overall queue+upstream timeout budget elapsed, whether or not an upstream attempt ever started. | 504 |
-| `invalid_response` | A connection was established but the response could not be read as well-formed HTTP. | 502 |
+| `invalid_response` | A connection was established but the response could not be read as a well-formed response. | 502 |
 | `upstream_error` | The connection/transport itself failed (DNS/TCP/TLS/protocol) before any response was read. | 502 |
 
 `provider.status` and `service.capabilities` are plain discovery reads and
-are not modeled with this enum; they use ordinary HTTP 200/404 semantics
+are not modeled with this enum; they use ordinary 200/404 status semantics
 (see `contract.json` for the 404 body shape).
 
 ## Scheduling: submitted-request FIFO
@@ -181,7 +204,7 @@ through this interface, in any form, in any version. A client that needs a
 provider's live status has `provider.status`; it never needs, and must never
 be given, a path to a provider credential.
 
-More generally: a conforming client only ever calls the three HTTP
+More generally: a conforming client only ever calls the three
 operations documented above and in `contract.json`. It never imports an
 `aalp.*` Python module, never instantiates `Gateway` or `Lane`, never
 calls a function not named on this page, and never reads `.aalp/` state

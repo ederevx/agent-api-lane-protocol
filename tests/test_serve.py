@@ -1,5 +1,7 @@
-import http.client
+import base64
 import json
+import socket
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,13 +9,26 @@ from pathlib import Path
 from aalp.serve import build_ingress
 
 _TIMEOUT = 2.0
+_LENGTH_PREFIX = struct.Struct(">I")
+
+
+def _recv_exact(sock, n):
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("peer closed before sending all expected bytes")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 class ServeEndToEndTest(unittest.TestCase):
     """Exercises aalp.serve.build_ingress as a real, out-of-process-shaped
     listener: a real Gateway wired to a real loopback Ingress, reachable
-    only through interface v1's own HTTP surface -- the same path a
-    genuine external client (ACP) would take."""
+    only through interface v1's own length-prefixed-JSON-over-`AF_UNIX`
+    surface -- the same path a genuine external client (ACP) would take."""
 
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -41,20 +56,26 @@ class ServeEndToEndTest(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
 
     def _get(self, path: str) -> tuple[int, dict]:
-        connection = http.client.HTTPConnection(
-            "127.0.0.1", self.ingress.port, timeout=_TIMEOUT)
+        envelope = json.dumps({
+            "method": "GET",
+            "path": path,
+            "headers": {"Authorization": f"Bearer {self.ingress.secret}"},
+            "body": "",
+        }).encode("utf-8")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(_TIMEOUT)
         try:
-            connection.request(
-                "GET", path,
-                headers={
-                    "Authorization": f"Bearer {self.ingress.secret}",
-                    "Content-Length": "0",
-                })
-            response = connection.getresponse()
-            body = response.read()
-            return response.status, json.loads(body)
+            sock.connect(str(self.ingress.socket_path))
+            sock.sendall(_LENGTH_PREFIX.pack(len(envelope)) + envelope)
+            header = _recv_exact(sock, _LENGTH_PREFIX.size)
+            (length,) = _LENGTH_PREFIX.unpack(header)
+            payload = _recv_exact(sock, length)
         finally:
-            connection.close()
+            sock.close()
+        response = json.loads(payload.decode("utf-8"))
+        raw_body = response.get("body") or ""
+        body = base64.b64decode(raw_body) if raw_body else b""
+        return response["status"], json.loads(body)
 
     def test_capabilities_reachable_over_real_socket(self) -> None:
         status, body = self._get("/_aalp/v1/capabilities")
@@ -72,8 +93,7 @@ class ServeEndToEndTest(unittest.TestCase):
         descriptor_path = self.root / ".aalp" / "state" / "ingress.json"
         self.assertTrue(descriptor_path.exists())
         descriptor = json.loads(descriptor_path.read_text())
-        self.assertEqual(descriptor["host"], "127.0.0.1")
-        self.assertEqual(descriptor["port"], self.ingress.port)
+        self.assertEqual(descriptor["socket_path"], str(self.ingress.socket_path))
 
 
 if __name__ == "__main__":
