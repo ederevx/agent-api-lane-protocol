@@ -79,6 +79,50 @@ class LaneFifoOrderTest(unittest.TestCase):
         self.assertIn("token", result)
 
 
+class LaneUnboundedProducerTest(unittest.TestCase):
+    def test_many_distinct_holders_all_admitted_fifo_with_no_count_cap(self) -> None:
+        # agent_protocols_v1_metadata_v1.md §9/§24: "unlimited logical
+        # producers may enqueue"; AALP imposes no agent-count policy of
+        # its own. Lane.acquire() takes an arbitrary opaque `holder`
+        # string and has no notion of a maximum distinct-holder count --
+        # only `capacity` (concurrency) gates how many leases are held
+        # at once, never how many holders may queue. Prove this
+        # directly with a producer count well past any small fixed
+        # number a hidden cap might use (e.g. 2 or 3), and confirm they
+        # all complete in strict submission order.
+        producer_count = 25
+        lane = Lane(capacity=1, lease_seconds=10)
+        token_first = lane.acquire("holder-0", timeout_seconds=1)
+
+        order: list[str] = []
+        order_lock = threading.Lock()
+
+        def waiter(holder: str) -> None:
+            token = lane.acquire(holder, timeout_seconds=5)
+            with order_lock:
+                order.append(holder)
+            lane.release(holder, token)
+
+        holders = [f"holder-{index}" for index in range(1, producer_count)]
+        threads = [threading.Thread(target=waiter, args=(holder,))
+                   for holder in holders]
+        for index, thread in enumerate(threads):
+            thread.start()
+            _wait_until(lambda expected=index + 1: len(lane.waiters) == expected)
+
+        # Every submitted producer was actually admitted to the queue --
+        # none was rejected or silently dropped because of how many
+        # distinct holders were already waiting.
+        self.assertEqual(len(lane.waiters), producer_count - 1)
+
+        lane.release("holder-0", token_first)
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual(order, holders)
+        self.assertEqual(lane.status()["queued"], 0)
+
+
 class LaneExpiryTest(unittest.TestCase):
     def test_expired_lease_reclaimed_without_explicit_release(self) -> None:
         clock = FakeClock()
