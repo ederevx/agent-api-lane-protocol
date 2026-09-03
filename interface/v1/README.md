@@ -25,6 +25,31 @@ repository. Everything a client needs to know about a provider — is it
 active, what's its concurrency ceiling, what paths does it accept — is
 available through `provider.status`.
 
+## Bootstrap: discovering AALP and authenticating
+
+Every operation below requires a live loopback HTTP connection to AALP and a
+bearer secret. A client discovers both the same way, and this is the one
+deliberate, narrow exception to "never read another protocol's private
+state": these two files, and only these two files, are a published part of
+interface v1, carved out of `.aalp/` specifically for this purpose
+(adjustment metadata §4).
+
+- **`<AALP root>/.aalp/state/ingress.json`** — written atomically by AALP's
+  ingress on startup, before it accepts any connection. Contains
+  `{"host": "127.0.0.1", "port": <int>, "secret_file": "<absolute path>"}`.
+  `<AALP root>` resolves to the `AALP_HOME` environment variable if set,
+  else the working directory AALP was started from; a client must be told
+  this root out-of-band (shared deployment configuration) — interface v1
+  defines no operation for locating an unknown root.
+- **`<secret_file>`** (default `<AALP root>/.aalp/state/ingress.secret`) —
+  an opaque bearer token, `0600`, owner-only, generated once. A client
+  reads its raw contents and sends them back as
+  `Authorization: Bearer <contents>` on every request below.
+
+A client reads exactly these two paths and nothing else under `.aalp/`.
+Credentials, the audit log, and provider-lane internals remain off-limits in
+every version of this interface.
+
 ## The three operations
 
 ### `service.capabilities`
@@ -160,8 +185,9 @@ More generally: a conforming client only ever calls the three HTTP
 operations documented above and in `contract.json`. It never imports an
 `aalp.*` Python module, never instantiates `Gateway` or `Lane`, never
 calls a function not named on this page, and never reads `.aalp/` state
-from disk. If a future need can't be met through this interface, the fix
-is to extend the interface (additively, if possible), not to reach
+from disk beyond the two bootstrap files named above. If a future need
+can't be met through this interface, the fix is to extend the interface
+(additively, if possible), not to reach
 around it.
 
 ## Compatibility rules
