@@ -9,10 +9,9 @@ branching in core logic. AALP owns provider credentials, one per
 provider id, under ignored repo-local `.aalp/credential/<provider id>`
 state.
 
-v1 ships two provider definitions: `ci` (CheapestInference, active,
-`concurrency_limit: 1`, preserving today's single-flight behavior) and
-`kourier` (kourier.sh, defined and endpoint-configurable, not yet
-activated or credentialed).
+v1 ships exactly one provider definition: `ci` (CheapestInference,
+active, `concurrency_limit: 1`, preserving today's single-flight
+behavior).
 
 AALP is one of three protocols defined in `agent_protocols_v1`:
 
