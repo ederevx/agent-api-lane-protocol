@@ -23,11 +23,12 @@ scheduling authority.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from . import audit
 from . import credential as credential_module
@@ -48,6 +49,18 @@ _STATUS_BY_OUTCOME: dict[Outcome, int] = {
     Outcome.INVALID_RESPONSE: 502,
     Outcome.UPSTREAM_ERROR: 502,
 }
+
+# The sole definition of interface v1's capability list — must match
+# interface/v1/contract.json's top-level "capabilities" array verbatim.
+# service.capabilities (below) is the only reader of this constant.
+INTERFACE_V1_CAPABILITIES: tuple[str, ...] = (
+    "request.forward",
+    "provider.status",
+    "provider.concurrency",
+    "request.timeout_outcomes",
+)
+
+_DISCOVERY_PATH_PREFIX = "_aalp"
 
 
 def _resolve_timeout(
@@ -268,6 +281,79 @@ class Gateway:
         finally:
             self.flows.close(flow_id, flow_token)
 
+    def _provider_status_object(self, provider: ProviderDefinition) -> dict[str, Any]:
+        lane = self.provider_lanes.get(provider.id)
+        if lane is not None:
+            # Lane.status() already calls its own (private) _expire()
+            # before counting, so this is always a fresh read — no
+            # separate expiry trigger is needed here. A quarantined
+            # (unconfirmed-close) lease is intentionally still counted
+            # in in_flight until its TTL reclaims it; that matches the
+            # contract's provider_status_object description verbatim.
+            lane_status = lane.status()
+            in_flight = lane_status["leased"]
+            queued = lane_status["queued"]
+            idle = lane_status["idle"]
+            idle_seconds = lane_status["idle_seconds"]
+        else:
+            # Inactive providers have no Lane at all; report the same
+            # zero/idle defaults a never-used active lane would show.
+            in_flight = 0
+            queued = 0
+            idle = True
+            idle_seconds = 0.0
+        return {
+            "id": provider.id,
+            "display_name": provider.display_name,
+            "active": provider.active,
+            "concurrency_limit": provider.concurrency_limit,
+            "in_flight": in_flight,
+            "queued": queued,
+            "idle": idle,
+            "idle_seconds": idle_seconds,
+            "accepted_paths": list(provider.request_shape.get("paths", [])),
+        }
+
+    def _handle_discovery(
+        self, method: str, segments: list[str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Serve service.capabilities and provider.status, both pure
+        read-only introspection reached under the reserved /_aalp/v1/...
+        prefix (see interface/v1/contract.json's transport_binding)."""
+        headers = {"Content-Type": "application/json"}
+        if method != "GET":
+            return 404, {}, b""
+
+        if segments == ["v1", "capabilities"]:
+            body = json.dumps({
+                "service": "aalp",
+                "interface_version": 1,
+                "capabilities": list(INTERFACE_V1_CAPABILITIES),
+            }).encode("utf-8")
+            return 200, headers, body
+
+        if len(segments) == 2 and segments[0] == "v1" and segments[1] == "providers":
+            providers = [
+                self._provider_status_object(provider)
+                for provider in self.providers.values()
+            ]
+            body = json.dumps({"providers": providers}).encode("utf-8")
+            return 200, headers, body
+
+        if len(segments) == 3 and segments[0] == "v1" and segments[1] == "providers":
+            provider_id = segments[2]
+            provider = self.providers.get(provider_id)
+            if provider is None:
+                body = json.dumps({
+                    "error": "provider_not_found",
+                    "provider_id": provider_id,
+                }).encode("utf-8")
+                return 404, headers, body
+            body = json.dumps(self._provider_status_object(provider)).encode("utf-8")
+            return 200, headers, body
+
+        return 404, {}, b""
+
     def as_ingress_handler(self) -> Handler:
         """Build the closure `aalp.ingress.Ingress` calls per request.
 
@@ -285,6 +371,10 @@ class Gateway:
             headers: dict[str, str],
             body: bytes,
         ) -> tuple[int, dict[str, str], bytes]:
+            segments = [segment for segment in path.split("/") if segment]
+            if segments and segments[0] == _DISCOVERY_PATH_PREFIX:
+                return self._handle_discovery(method, segments[1:])
+
             provider_id, _, rest = path.lstrip("/").partition("/")
             forwarded_path = "/" + rest
 
@@ -295,11 +385,25 @@ class Gateway:
             result = self.handle(
                 flow_id, provider_id, method, forwarded_path, headers, body)
 
-            if result.outcome is Outcome.SUCCESS:
-                status = result.status_code
-            else:
-                status = _STATUS_BY_OUTCOME.get(result.outcome, 502)
+            response_headers = dict(result.headers)
+            response_headers["X-Aalp-Outcome"] = result.outcome.value
 
-            return status, dict(result.headers), result.body
+            if result.outcome is Outcome.SUCCESS:
+                return result.status_code, response_headers, result.body
+
+            status = _STATUS_BY_OUTCOME.get(result.outcome, 502)
+            response_body = result.body
+            if not response_body:
+                # interface/v1/contract.json's on_other_outcome body is
+                # required, not optional; a pipeline stage's AalpResult
+                # never populates one (only SUCCESS carries a body), so
+                # it is synthesized here, at the one place a response
+                # actually leaves the process.
+                response_headers["Content-Type"] = "application/json"
+                response_body = json.dumps({
+                    "outcome": result.outcome.value,
+                    "message": result.message,
+                }).encode("utf-8")
+            return status, response_headers, response_body
 
         return _handler
