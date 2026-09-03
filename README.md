@@ -18,11 +18,15 @@ specifically — not a system-wide constraint).
 
 Run AALP as a standalone process with `python -m aalp` (see
 `aalp/serve.py`); it constructs `Gateway` from `providers/` and starts
-`Ingress` on it, publishing `.aalp/state/ingress.json` +
-`.aalp/state/ingress.secret` for a client to bootstrap against (see
-`interface/v1/README.md`'s Bootstrap section). `--providers-dir`,
-`--root`, `--host`, and `--port` override the `AALP_PROVIDERS_DIR`/
-`AALP_HOME`-derived defaults.
+`Ingress` on it over a Unix domain socket, publishing
+`.aalp/state/ingress.json` + `.aalp/state/ingress.secret` for a client to
+bootstrap against (see `interface/v1/README.md`'s Bootstrap section).
+`--providers-dir`, `--root`, and `--socket-path` override the
+`AALP_PROVIDERS_DIR`/`AALP_HOME`-derived defaults.
+
+To run AALP as a supervised, boot-surviving service instead of a foreground
+process, see `deploy/install.sh` (installs `deploy/aalp.service` as a
+`systemd --user` unit).
 
 AALP is one of three protocols defined in `agent_protocols_v1`:
 

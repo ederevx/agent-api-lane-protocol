@@ -1,0 +1,16 @@
+[Unit]
+Description=AALP (agent-api-lane-protocol) standalone ingress
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+WorkingDirectory=%h/agent-api-lane-protocol
+Environment=PYTHONPATH=%h/agent-api-lane-protocol
+Environment=AALP_HOME=%h/agent-api-lane-protocol
+ExecStart=/usr/bin/python3 -m aalp --root %h/agent-api-lane-protocol
+
+[Install]
+WantedBy=default.target
