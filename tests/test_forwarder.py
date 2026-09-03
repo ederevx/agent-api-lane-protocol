@@ -1,4 +1,6 @@
 import socket
+import threading
+import time
 import unittest
 from typing import Any
 
@@ -107,6 +109,33 @@ class HeaderInjectionTest(unittest.TestCase):
         self.assertEqual(auth_values, ["Bearer secret-token"])
         self.assertEqual(headers.get("X-Other"), "keep-me")
 
+    def test_inbound_connection_specific_headers_are_not_forwarded(self):
+        # A real inbound ingress request's headers (aalp/ingress.py hands
+        # `forward()` every header off the request it received) name the
+        # *loopback* connection, not the upstream one. Forwarding them
+        # verbatim broke real traffic to the 'ci' provider: a stale
+        # `Host: 127.0.0.1:<port>` header made Cloudflare 403 the request
+        # with an HTML error page before it ever reached the backend.
+        provider = make_provider()
+        fake = FakeConnection()
+        forward(
+            provider, "tok", "POST", "/v1/messages",
+            {
+                "Host": "127.0.0.1:54321",
+                "Content-Length": "2",
+                "Connection": "keep-alive",
+                "X-Other": "keep-me",
+            },
+            b"{}", 10.0,
+            connection_factory=lambda p, t: fake,
+        )
+        _method, _path, _body, headers = fake.requests[0]
+        lowered = {name.lower() for name in headers}
+        self.assertNotIn("host", lowered)
+        self.assertNotIn("content-length", lowered)
+        self.assertNotIn("connection", lowered)
+        self.assertEqual(headers.get("X-Other"), "keep-me")
+
     def test_upstream_path_prefixes_endpoint_path(self):
         provider = make_provider()
         fake = FakeConnection()
@@ -187,6 +216,78 @@ class ClosedBoolTest(unittest.TestCase):
         self.assertFalse(closed)
         self.assertEqual(result.outcome, Outcome.SUCCESS)
         self.assertEqual(result.body, b"fine")
+
+
+class _SlowFakeResponse:
+    """A response body that never raises its own socket.timeout, no
+    matter how long read() blocks -- standing in for a real upstream
+    that keeps trickling a few bytes every couple of seconds, which
+    resets http.client's per-read timeout without ever finishing. Only
+    unblocks when the test itself releases it, well after forward()
+    should already have given up."""
+
+    status = 200
+
+    def __init__(self, release: threading.Event):
+        self._release = release
+
+    def getheaders(self):
+        return []
+
+    def read(self):
+        self._release.wait(timeout=5.0)
+        return b'{"content": []}'
+
+
+class SlowFakeConnection:
+    """Confirmed via a live activation run: a real upstream response
+    delivered as slowly-trickling chunks never trips http.client's own
+    timeout= (which only bounds gaps between reads), so a plain blocking
+    forward() implementation would block far longer than
+    `timeout_seconds` in aggregate. This fake reproduces that shape
+    without any real sockets or real time: its read() only returns once
+    the test explicitly releases it, long after forward()'s own
+    deadline -- proving forward() stops *waiting* on schedule rather
+    than depending on the connection itself being interrupted."""
+
+    def __init__(self, release: threading.Event):
+        self.requests: list[tuple] = []
+        self.closed = False
+        self._response = _SlowFakeResponse(release)
+
+    def request(self, method, path, body=None, headers=None):
+        self.requests.append((method, path, body, headers))
+
+    def getresponse(self):
+        return self._response
+
+    def close(self):
+        self.closed = True
+
+
+class DeadlineWatchdogTest(unittest.TestCase):
+    def test_slow_trickling_response_returns_promptly_as_compression_timeout(self):
+        provider = make_provider()
+        release = threading.Event()
+        fake = SlowFakeConnection(release)
+        started = time.monotonic()
+        try:
+            result, closed = forward(
+                provider, "tok", "POST", "/v1/messages", {}, b"{}",
+                timeout_seconds=0.2,
+                connection_factory=lambda p, t: fake,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            # Let the abandoned background thread's read() return so it
+            # doesn't linger past this test.
+            release.set()
+
+        self.assertEqual(result.outcome, Outcome.COMPRESSION_TIMEOUT)
+        # Unconfirmed close -- forward() gave up waiting, it never
+        # learned whether the connection actually stopped.
+        self.assertFalse(closed)
+        self.assertLess(elapsed, 2.0)
 
 
 class BuildConnectionTest(unittest.TestCase):
