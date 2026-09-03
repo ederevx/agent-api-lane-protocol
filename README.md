@@ -16,6 +16,14 @@ v1 ships exactly one provider definition: `ci` (CheapestInference,
 active, `concurrency_limit: 1`, single-flight for that provider
 specifically — not a system-wide constraint).
 
+Run AALP as a standalone process with `python -m aalp` (see
+`aalp/serve.py`); it constructs `Gateway` from `providers/` and starts
+`Ingress` on it, publishing `.aalp/state/ingress.json` +
+`.aalp/state/ingress.secret` for a client to bootstrap against (see
+`interface/v1/README.md`'s Bootstrap section). `--providers-dir`,
+`--root`, `--host`, and `--port` override the `AALP_PROVIDERS_DIR`/
+`AALP_HOME`-derived defaults.
+
 AALP is one of three protocols defined in `agent_protocols_v1`:
 
 - **ADP** (`agent-delegation-protocol`) — native-only delegation
