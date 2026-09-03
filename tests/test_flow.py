@@ -74,35 +74,6 @@ class FlowAdmissionExpiryTest(unittest.TestCase):
         token_101 = flows.admit("101", timeout_seconds=0)
         self.assertTrue(token_101)
 
-    def test_renew_keeps_flow_alive_across_its_own_requests(self) -> None:
-        clock = FakeClock()
-        flows = FlowAdmission(lease_seconds=5, clock=clock.now)
-        token = flows.admit("100", timeout_seconds=1)
-
-        clock.advance(4.0)
-        renewed = flows.renew("100", token)
-        self.assertEqual(renewed, token)
-
-        clock.advance(4.0)
-        # Elapsed since admit() is 8.0s (> lease_seconds), but renew()
-        # reset the TTL at t=4.0, so 100 must still hold the slot.
-        with self.assertRaises(LaneTimeout):
-            flows.admit("101", timeout_seconds=0)
-
-    def test_renew_by_a_different_flow_is_rejected(self) -> None:
-        flows = FlowAdmission(lease_seconds=5)
-        token = flows.admit("100", timeout_seconds=1)
-        with self.assertRaises(ValueError):
-            flows.renew("101", token)
-
-    def test_renew_after_expiry_raises_rather_than_silently_succeeding(self) -> None:
-        clock = FakeClock()
-        flows = FlowAdmission(lease_seconds=5, clock=clock.now)
-        token = flows.admit("100", timeout_seconds=1)
-        clock.advance(5.1)
-        with self.assertRaises(ValueError):
-            flows.renew("100", token)
-
 
 if __name__ == "__main__":
     unittest.main()

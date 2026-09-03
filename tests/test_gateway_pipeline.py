@@ -169,8 +169,8 @@ class BoundedConcurrencyTest(_TempGatewayCase):
         stop_sampling.set()
         sampler.join(timeout=2)
 
-        self.assertTrue(results["first"][0].ok)
-        self.assertTrue(results["second"][0].ok)
+        self.assertTrue(results["first"].ok)
+        self.assertTrue(results["second"].ok)
         self.assertLessEqual(peak["value"], 1)
 
 
@@ -197,11 +197,10 @@ class QueueTimeoutTest(_TempGatewayCase):
         _wait_until(
             lambda: gateway.provider_lanes["prov"].status()["leased"] == 1)
 
-        result, token = gateway.handle(
+        result = gateway.handle(
             "flow-B", "prov", "POST", "/v1/messages", {}, b"{}")
 
         self.assertEqual(result.outcome, Outcome.QUEUE_TIMEOUT)
-        self.assertIsNone(token)
 
         block_event.set()
         thread_first.join(timeout=2)
@@ -223,15 +222,16 @@ class TotalTimeoutTest(_TempGatewayCase):
             self.providers_dir, root=self.root, clock=clock.now,
             connection_factory=never_called_connection_factory)
 
-        result, token = gateway.handle(
+        result = gateway.handle(
             "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
 
         self.assertEqual(result.outcome, Outcome.TOTAL_TIMEOUT)
-        # The flow lease is still legitimately held (the flow may
-        # continue with a later request), so it must not be None.
-        self.assertIsNotNone(token)
         self.assertEqual(
             gateway.provider_lanes["prov"].status()["leased"], 0)
+        # The flow lease is released unconditionally once admitted, even
+        # on this early-return path, so the next submitted request is
+        # never left waiting on it.
+        self.assertEqual(gateway.flows.status()["leased"], 0)
 
 
 class QuarantineTest(_TempGatewayCase):
@@ -248,7 +248,7 @@ class QuarantineTest(_TempGatewayCase):
             connection_factory=lambda provider, timeout: fake_conn,
             lease_seconds=5.0)
 
-        result, _token = gateway.handle(
+        result = gateway.handle(
             "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
 
         self.assertTrue(result.ok)
@@ -256,7 +256,7 @@ class QuarantineTest(_TempGatewayCase):
             gateway.provider_lanes["prov"].status()["leased"], 1)
 
         clock.advance(5.1)
-        result2, _token2 = gateway.handle(
+        result2 = gateway.handle(
             "flow-B", "prov", "POST", "/v1/messages", {}, b"{}")
 
         self.assertTrue(result2.ok)
@@ -274,7 +274,7 @@ class ConfirmedCloseTest(_TempGatewayCase):
             connection_factory=lambda provider, timeout: fake_conn,
             lease_seconds=5.0)
 
-        result, _token = gateway.handle(
+        result = gateway.handle(
             "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
 
         self.assertTrue(result.ok)
@@ -292,11 +292,10 @@ class UnavailableProviderTest(_TempGatewayCase):
             self.providers_dir, root=self.root,
             connection_factory=lambda provider, timeout: FakeConnection())
 
-        result, token = gateway.handle(
+        result = gateway.handle(
             "flow-A", "unknown-provider", "POST", "/v1/messages", {}, b"{}")
 
         self.assertEqual(result.outcome, Outcome.UNAVAILABLE)
-        self.assertIsNotNone(token)
 
 
 class AuditBlindnessTest(_TempGatewayCase):
@@ -310,7 +309,7 @@ class AuditBlindnessTest(_TempGatewayCase):
             self.providers_dir, root=self.root,
             connection_factory=lambda provider, timeout: fake_conn)
 
-        result, _token = gateway.handle(
+        result = gateway.handle(
             "flow-A", "prov", "POST", "/v1/messages",
             {"X-Marker": "header-secret-value"},
             b"request-secret-body")
@@ -327,31 +326,83 @@ class AuditBlindnessTest(_TempGatewayCase):
             self.assertNotIn(forbidden, serialized)
 
 
-class FlowContinuationTest(_TempGatewayCase):
-    def test_second_request_in_same_flow_reuses_token_without_requeue(self) -> None:
+class SubmittedRequestFifoOrderTest(_TempGatewayCase):
+    """Direct acceptance tests for request-scoped flow admission: flow
+    admission is a single shared FIFO lane, admitted fresh and released
+    unconditionally on every request, so requests execute in strict
+    submission order regardless of which flow they belong to."""
+
+    def _assert_fifo_execution_order(self, submissions) -> None:
+        """`submissions`: [(marker, flow_id), ...] in submission order."""
         _write_provider(self.providers_dir, "prov", concurrency_limit=1)
         write_credential("prov", "fake-token", root=self.root)
 
-        fake_conn = FakeConnection(response=FakeResponse(status=200, body=b"ok"))
+        execution_order: list[str] = []
+        block_first = threading.Event()
+
+        class RecordingConnection:
+            def __init__(self) -> None:
+                self._first = True
+
+            def request(self, method, path, body=None, headers=None):
+                execution_order.append((headers or {}).get("X-Test-Marker"))
+
+            def getresponse(self):
+                if self._first:
+                    self._first = False
+                    block_first.wait()
+                return FakeResponse(status=200, body=b"ok")
+
+            def close(self) -> None:
+                pass
+
+        conn = RecordingConnection()
         gateway = Gateway(
             self.providers_dir, root=self.root,
-            connection_factory=lambda provider, timeout: fake_conn)
+            connection_factory=lambda provider, timeout: conn,
+            lease_seconds=5.0)
 
-        result1, token1 = gateway.handle(
-            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
-        self.assertTrue(result1.ok)
-        self.assertIsNotNone(token1)
+        results = {}
+        threads = []
 
-        result2, token2 = gateway.handle(
-            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}",
-            flow_token=token1)
+        def submit(marker: str, flow_id: str) -> None:
+            results[marker] = gateway.handle(
+                flow_id, "prov", "POST", "/v1/messages",
+                {"X-Test-Marker": marker}, b"{}")
 
-        self.assertTrue(result2.ok)
-        # renew() returns the identical token; a fresh admit() (i.e. a
-        # re-queue) would mint a brand-new one, so equality here proves
-        # the second call never had to queue behind anything.
-        self.assertEqual(token2, token1)
-        self.assertEqual(gateway.flows.status()["queued"], 0)
+        for index, (marker, flow_id) in enumerate(submissions):
+            thread = threading.Thread(target=submit, args=(marker, flow_id))
+            thread.start()
+            threads.append(thread)
+            if index == 0:
+                _wait_until(lambda: gateway.flows.status()["leased"] == 1)
+            else:
+                _wait_until(
+                    lambda expected=index:
+                        gateway.flows.status()["queued"] == expected)
+
+        block_first.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual(execution_order, [marker for marker, _ in submissions])
+        for marker, _ in submissions:
+            self.assertTrue(results[marker].ok)
+
+    def test_completing_a_flows_request_does_not_let_it_cut_ahead_for_a_later_one(
+        self,
+    ) -> None:
+        # A1, B1, A2 submitted in that order (flow A submits twice, with
+        # flow B's request landing between them) must execute in exactly
+        # that order — completing A1 must not let flow A reserve
+        # anything for A2 ahead of B1.
+        self._assert_fifo_execution_order(
+            [("A1", "flow-A"), ("B1", "flow-B"), ("A2", "flow-A")])
+
+    def test_fifo_order_is_independent_of_flow_identity(self) -> None:
+        self._assert_fifo_execution_order(
+            [("X1", "flow-X"), ("Y1", "flow-Y"), ("Z1", "flow-Z"),
+             ("Y2", "flow-Y")])
 
 
 class IngressAdapterTest(_TempGatewayCase):
@@ -366,13 +417,9 @@ class IngressAdapterTest(_TempGatewayCase):
     def test_path_prefix_strips_provider_segment_before_handle(self) -> None:
         calls = []
 
-        def fake_handle(flow_id, provider_id, method, path, headers, body,
-                         flow_token=None):
-            calls.append((flow_id, provider_id, method, path, flow_token))
-            return (
-                AalpResult(Outcome.SUCCESS, status_code=200, body=b"ok"),
-                "next-token",
-            )
+        def fake_handle(flow_id, provider_id, method, path, headers, body):
+            calls.append((flow_id, provider_id, method, path))
+            return AalpResult(Outcome.SUCCESS, status_code=200, body=b"ok")
 
         self.gateway.handle = fake_handle
         adapter = self.gateway.as_ingress_handler()
@@ -383,13 +430,12 @@ class IngressAdapterTest(_TempGatewayCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(body, b"ok")
-        self.assertEqual(headers.get("X-Aalp-Flow-Token"), "next-token")
+        self.assertNotIn("X-Aalp-Flow-Token", headers)
         self.assertEqual(len(calls), 1)
-        flow_id, provider_id, _method, path, flow_token = calls[0]
+        flow_id, provider_id, _method, path = calls[0]
         self.assertEqual(flow_id, "flow-1")
         self.assertEqual(provider_id, "prov")
         self.assertEqual(path, "/v1/messages")
-        self.assertIsNone(flow_token)
 
     def test_missing_flow_id_header_returns_400_without_calling_handle(self) -> None:
         def never_called(*args, **kwargs):
@@ -403,12 +449,9 @@ class IngressAdapterTest(_TempGatewayCase):
 
         self.assertEqual(status, 400)
 
-    def test_non_success_outcome_maps_to_ingress_status_with_flow_token_header(
-        self,
-    ) -> None:
-        def fake_handle(flow_id, provider_id, method, path, headers, body,
-                         flow_token=None):
-            return AalpResult(Outcome.UNAVAILABLE), "carry-token"
+    def test_non_success_outcome_maps_to_ingress_status(self) -> None:
+        def fake_handle(flow_id, provider_id, method, path, headers, body):
+            return AalpResult(Outcome.UNAVAILABLE)
 
         self.gateway.handle = fake_handle
         adapter = self.gateway.as_ingress_handler()
@@ -419,7 +462,7 @@ class IngressAdapterTest(_TempGatewayCase):
             {"x-aalp-flow-id": "flow-2"}, b"{}")
 
         self.assertEqual(status, 503)
-        self.assertEqual(headers.get("X-Aalp-Flow-Token"), "carry-token")
+        self.assertNotIn("X-Aalp-Flow-Token", headers)
 
 
 class MigrateCiWiringTest(unittest.TestCase):

@@ -1,13 +1,17 @@
-"""Per-flow admission.
+"""Per-request admission.
 
-At most one flow's requests may be in flight through AALP at a time.
+At most one request may be in flight through AALP at a time.
 `FlowAdmission` wraps a single shared `Lane(capacity=1, ...)` — that
 lane's own FIFO ticket order *is* the request queue required by
-agent_protocols_v1_metadata_v1.md §24, and reusing one lease across a
-flow's own sequence of requests (A, then B, then C) rather than
-re-queueing on each one is what satisfies per-flow locking (§25)
-without letting a later-arrived flow cut in front of an already-active
-one's continuation.
+agent_protocols_v1_metadata_v1.md §24. Admission is strictly
+request-scoped: every request admits fresh, in submission order, and
+is closed the moment that request ends. A flow's own later request
+gets no special treatment beyond the ordering its submission time
+naturally gives it in the shared FIFO — this is what keeps submitted
+requests (e.g. A1, B1, A2) executing in exactly submission order
+regardless of which flow they belong to (§25), rather than letting one
+flow reserve the lane across its own requests and cut ahead of another
+flow's earlier-submitted one.
 """
 from __future__ import annotations
 
@@ -20,7 +24,13 @@ __all__ = ["FlowAdmission", "LaneTimeout"]
 
 
 class FlowAdmission:
-    """Serializes access across flows using one shared FIFO lane."""
+    """Admits one request at a time, in submission order, via one shared
+    FIFO lane. Request-scoped: each call to admit() takes a fresh ticket
+    and must be paired with a close() once that single request ends —
+    there is no cross-request renewal, so a flow's own next request
+    re-queues like anyone else's, taking its place strictly by
+    submission order rather than by flow identity.
+    """
 
     def __init__(
         self,
@@ -30,21 +40,11 @@ class FlowAdmission:
         self._lane = Lane(capacity=1, lease_seconds=lease_seconds, clock=clock)
 
     def admit(self, flow_id: str, timeout_seconds: float) -> str:
-        """FIFO-block until `flow_id` is the sole active flow; return a token.
+        """FIFO-block until this request is the sole active one; return a token.
 
         Raises LaneTimeout if no slot opened up in time.
         """
         return self._lane.acquire(flow_id, timeout_seconds=timeout_seconds)
-
-    def renew(self, flow_id: str, token: str) -> str:
-        """Keep an already-admitted flow's lease alive for its next request.
-
-        Raises ValueError if `token` is not currently held by `flow_id` —
-        including when its TTL already lapsed, in which case the caller
-        must fall back to admit() and re-queue rather than assume it is
-        still the active flow.
-        """
-        return self._lane.acquire(flow_id, timeout_seconds=0, token=token)
 
     def close(self, flow_id: str, token: str) -> bool:
         """Release a finished flow's lease immediately.

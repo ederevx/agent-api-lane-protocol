@@ -9,9 +9,17 @@ design choice: the concrete wire protocol `as_ingress_handler()`
 exposes over `aalp.ingress.Ingress`. Nothing upstream of this module
 pins that down, so it is pinned down here, plainly: the inbound HTTP
 path's first `/`-delimited segment names the provider (stripped before
-forwarding), and flow identity travels as the `X-Aalp-Flow-Id` /
-`X-Aalp-Flow-Token` headers. A different ingress adapter could make
-different choices without touching `Gateway.handle()` at all.
+forwarding), and flow identity travels as the `X-Aalp-Flow-Id` header.
+A different ingress adapter could make different choices without
+touching `Gateway.handle()` at all.
+
+Flow admission is request-scoped: `handle()` admits fresh on every
+call and releases unconditionally before returning, so submitted
+requests execute in strict submission-order FIFO (agent_protocols_v1_
+metadata_v1.md §24/§25) regardless of which flow they belong to. There
+is no renewal mechanism a caller can use to keep a flow "active" across
+requests — `X-Aalp-Flow-Id` is purely an audit/grouping label with no
+scheduling authority.
 """
 from __future__ import annotations
 
@@ -117,10 +125,9 @@ class Gateway:
         flow_id: str,
         path: str,
         result: AalpResult,
-        resolved_flow_token: str | None,
         start: float,
         queue_wait_ms: float,
-    ) -> tuple[AalpResult, str | None]:
+    ) -> AalpResult:
         elapsed_ms = (self.clock() - start) * 1000
         audit.append(
             provider_id,
@@ -132,7 +139,7 @@ class Gateway:
             elapsed_ms=elapsed_ms,
             root=self.root,
         )
-        return result, resolved_flow_token
+        return result
 
     def handle(
         self,
@@ -142,8 +149,7 @@ class Gateway:
         path: str,
         headers: dict[str, str],
         body: bytes,
-        flow_token: str | None = None,
-    ) -> tuple[AalpResult, str | None]:
+    ) -> AalpResult:
         start = self.clock()
         # Looked up now purely so a per-provider timeout_overrides entry
         # can apply to the two deadlines below; an unknown/inactive
@@ -162,129 +168,115 @@ class Gateway:
                 Outcome.UNAVAILABLE,
                 message=f"provider {provider_id!r} is not available")
 
-        resolved_flow_token = flow_token
         remaining = queue_deadline - self.clock()
         if remaining <= 0:
             result = AalpResult(Outcome.QUEUE_TIMEOUT)
             queue_wait_ms = (self.clock() - start) * 1000
             return self._audit_and_return(
-                provider_id, flow_id, path, result, resolved_flow_token,
-                start, queue_wait_ms)
+                provider_id, flow_id, path, result, start, queue_wait_ms)
 
         try:
-            if flow_token:
-                try:
-                    resolved_flow_token = self.flows.renew(
-                        flow_id, flow_token)
-                except ValueError:
-                    resolved_flow_token = self.flows.admit(
-                        flow_id, timeout_seconds=remaining)
-            else:
-                resolved_flow_token = self.flows.admit(
-                    flow_id, timeout_seconds=remaining)
+            flow_token = self.flows.admit(flow_id, timeout_seconds=remaining)
         except LaneTimeout:
             result = AalpResult(Outcome.QUEUE_TIMEOUT)
-            resolved_flow_token = flow_token  # no lease was ever obtained
             queue_wait_ms = (self.clock() - start) * 1000
             return self._audit_and_return(
-                provider_id, flow_id, path, result, resolved_flow_token,
-                start, queue_wait_ms)
+                provider_id, flow_id, path, result, start, queue_wait_ms)
 
-        queue_wait_ms = (self.clock() - start) * 1000
-
-        if self.clock() >= total_deadline:
-            # The flow lease is still legitimately held here — this flow
-            # may continue with a later request, so it is not released.
-            result = AalpResult(Outcome.TOTAL_TIMEOUT)
-            return self._audit_and_return(
-                provider_id, flow_id, path, result, resolved_flow_token,
-                start, queue_wait_ms)
-
-        if unavailable_result is not None:
-            return self._audit_and_return(
-                provider_id, flow_id, path, unavailable_result,
-                resolved_flow_token, start, queue_wait_ms)
-
-        lane = self.provider_lanes[provider_id]
-        remaining = queue_deadline - self.clock()
-        if remaining <= 0:
-            result = AalpResult(Outcome.QUEUE_TIMEOUT)
-            return self._audit_and_return(
-                provider_id, flow_id, path, result, resolved_flow_token,
-                start, queue_wait_ms)
-
+        # Admission succeeded: every return path from here on must
+        # release this request's flow lease, so the next FIFO waiter
+        # (regardless of flow identity) is never kept waiting on it.
         try:
-            provider_token = lane.acquire(flow_id, timeout_seconds=remaining)
-        except LaneTimeout:
-            result = AalpResult(Outcome.QUEUE_TIMEOUT)
-            return self._audit_and_return(
-                provider_id, flow_id, path, result, resolved_flow_token,
-                start, queue_wait_ms)
+            queue_wait_ms = (self.clock() - start) * 1000
 
-        if self.clock() >= total_deadline:
-            # Confirmed-idle slot (no network attempt happened yet), so
-            # an explicit release here is safe — unlike the quarantine
-            # case below, there is nothing to leave the TTL to clean up.
-            lane.release(flow_id, provider_token)
-            result = AalpResult(Outcome.TOTAL_TIMEOUT)
-            return self._audit_and_return(
-                provider_id, flow_id, path, result, resolved_flow_token,
-                start, queue_wait_ms)
+            if self.clock() >= total_deadline:
+                result = AalpResult(Outcome.TOTAL_TIMEOUT)
+                return self._audit_and_return(
+                    provider_id, flow_id, path, result, start, queue_wait_ms)
 
-        stop_heartbeat = threading.Event()
-        interval = self.lease_seconds / 3
+            if unavailable_result is not None:
+                return self._audit_and_return(
+                    provider_id, flow_id, path, unavailable_result,
+                    start, queue_wait_ms)
 
-        def _heartbeat_loop() -> None:
-            while not stop_heartbeat.wait(interval):
-                lane.heartbeat(flow_id, provider_token)
+            lane = self.provider_lanes[provider_id]
+            remaining = queue_deadline - self.clock()
+            if remaining <= 0:
+                result = AalpResult(Outcome.QUEUE_TIMEOUT)
+                return self._audit_and_return(
+                    provider_id, flow_id, path, result, start, queue_wait_ms)
 
-        heartbeat_thread = threading.Thread(
-            target=_heartbeat_loop, daemon=True)
-        heartbeat_thread.start()
-        try:
-            credential = credential_module.read_credential(
-                provider_id, root=self.root)
-            compression_timeout = _resolve_timeout(
-                provider, "compression_timeout_seconds",
-                "ACP_COMPRESSION_TIMEOUT", 60)
             try:
-                result, closed = forwarder.forward(
-                    provider, credential, method, path, headers, body,
-                    timeout_seconds=compression_timeout,
-                    connection_factory=self.connection_factory,
-                )
-            except ValueError as error:
-                # Bad `path` — a config/caller bug, never a real network
-                # attempt, so the slot is confirmed idle.
-                result = AalpResult(Outcome.UNAVAILABLE, message=str(error))
-                closed = True
+                provider_token = lane.acquire(
+                    flow_id, timeout_seconds=remaining)
+            except LaneTimeout:
+                result = AalpResult(Outcome.QUEUE_TIMEOUT)
+                return self._audit_and_return(
+                    provider_id, flow_id, path, result, start, queue_wait_ms)
+
+            if self.clock() >= total_deadline:
+                # Confirmed-idle slot (no network attempt happened yet),
+                # so an explicit release here is safe — unlike the
+                # quarantine case below, there is nothing to leave the
+                # TTL to clean up.
+                lane.release(flow_id, provider_token)
+                result = AalpResult(Outcome.TOTAL_TIMEOUT)
+                return self._audit_and_return(
+                    provider_id, flow_id, path, result, start, queue_wait_ms)
+
+            stop_heartbeat = threading.Event()
+            interval = self.lease_seconds / 3
+
+            def _heartbeat_loop() -> None:
+                while not stop_heartbeat.wait(interval):
+                    lane.heartbeat(flow_id, provider_token)
+
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop, daemon=True)
+            heartbeat_thread.start()
+            try:
+                credential = credential_module.read_credential(
+                    provider_id, root=self.root)
+                compression_timeout = _resolve_timeout(
+                    provider, "compression_timeout_seconds",
+                    "ACP_COMPRESSION_TIMEOUT", 60)
+                try:
+                    result, closed = forwarder.forward(
+                        provider, credential, method, path, headers, body,
+                        timeout_seconds=compression_timeout,
+                        connection_factory=self.connection_factory,
+                    )
+                except ValueError as error:
+                    # Bad `path` — a config/caller bug, never a real
+                    # network attempt, so the slot is confirmed idle.
+                    result = AalpResult(Outcome.UNAVAILABLE, message=str(error))
+                    closed = True
+            finally:
+                stop_heartbeat.set()
+                heartbeat_thread.join()
+
+            if closed:
+                lane.release(flow_id, provider_token)
+            # else: leave the lease in place. This *is* §19 quarantine — an
+            # unconfirmed close means we cannot prove the upstream operation
+            # actually stopped, so the slot is left held until its own TTL
+            # (lease_seconds) reclaims it, rather than building a second
+            # mechanism for the same guarantee Lane already provides.
+
+            return self._audit_and_return(
+                provider_id, flow_id, path, result, start, queue_wait_ms)
         finally:
-            stop_heartbeat.set()
-            heartbeat_thread.join()
-
-        if closed:
-            lane.release(flow_id, provider_token)
-        # else: leave the lease in place. This *is* §19 quarantine — an
-        # unconfirmed close means we cannot prove the upstream operation
-        # actually stopped, so the slot is left held until its own TTL
-        # (lease_seconds) reclaims it, rather than building a second
-        # mechanism for the same guarantee Lane already provides.
-
-        return self._audit_and_return(
-            provider_id, flow_id, path, result, resolved_flow_token,
-            start, queue_wait_ms)
-
-    def close_flow(self, flow_id: str, token: str) -> bool:
-        """Release a finished flow's lease once ACP signals the whole
-        flow — not just one request — is done."""
-        return self.flows.close(flow_id, token)
+            self.flows.close(flow_id, flow_token)
 
     def as_ingress_handler(self) -> Handler:
         """Build the closure `aalp.ingress.Ingress` calls per request.
 
-        See the module docstring: the path-prefixed provider id and
-        `X-Aalp-Flow-*` headers are this pass's own concrete choice of
-        wire protocol, made here and nowhere upstream.
+        See the module docstring: the path-prefixed provider id and the
+        `X-Aalp-Flow-Id` header are this pass's own concrete choice of
+        wire protocol, made here and nowhere upstream. `X-Aalp-Flow-Id`
+        carries no scheduling authority — it is passed through to
+        `flow_id` purely as an audit/grouping label; every request is
+        admitted fresh, in submission order, regardless of its value.
         """
 
         def _handler(
@@ -299,21 +291,15 @@ class Gateway:
             flow_id = _header(headers, "X-Aalp-Flow-Id")
             if not flow_id:
                 return 400, {}, b"missing X-Aalp-Flow-Id header"
-            flow_token = _header(headers, "X-Aalp-Flow-Token")
 
-            result, resolved_flow_token = self.handle(
-                flow_id, provider_id, method, forwarded_path, headers,
-                body, flow_token=flow_token)
+            result = self.handle(
+                flow_id, provider_id, method, forwarded_path, headers, body)
 
             if result.outcome is Outcome.SUCCESS:
                 status = result.status_code
             else:
                 status = _STATUS_BY_OUTCOME.get(result.outcome, 502)
 
-            response_headers = dict(result.headers)
-            if resolved_flow_token is not None:
-                response_headers["X-Aalp-Flow-Token"] = resolved_flow_token
-
-            return status, response_headers, result.body
+            return status, dict(result.headers), result.body
 
         return _handler
