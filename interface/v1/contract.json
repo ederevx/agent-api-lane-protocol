@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-api-lane-protocol/interface/v1/contract.json",
+  "service": "aalp",
+  "interface_version": 1,
+  "title": "AALP interface v1",
+  "description": "Provider-agnostic external-API transport service, exposed to cross-protocol clients (primarily ACP) without depending on any AALP-private Python module, class, or on-disk state. This is the sole cross-protocol-supported surface of AALP; it deliberately excludes AALP's own administrative/credential functionality.",
+
+  "capabilities": [
+    "request.forward",
+    "provider.status",
+    "provider.concurrency",
+    "request.timeout_outcomes"
+  ],
+
+  "excluded_from_this_interface": {
+    "credential.read": "AALP-owned administrative functionality. Never exposed to cross-protocol clients through interface v1, in any form.",
+    "credential.write": "Same as credential.read.",
+    "credential.probe": "Same as credential.read.",
+    "request.batch": "Deferred. No genuine finite-batch need has been demonstrated by ACP yet; may become a new, additive, capability-gated operation in a later interface_version 1.x once one is."
+  },
+
+  "authentication": {
+    "mechanism": "single bearer secret over a loopback HTTP connection",
+    "notes": "AALP has exactly one authorized client per host (ACP). The bearer secret is transport/session bootstrap material, not a per-request credential, and is out of scope for this document's field-level schemas. It is never a provider credential and this interface never exposes provider credentials (see excluded_from_this_interface)."
+  },
+
+  "transport_binding": {
+    "normative_for": "request.forward",
+    "informative_for": ["provider.status", "service.capabilities"],
+    "notes": "request.forward's binding below is AALP's existing, already-implemented wire protocol and is normative: a conforming AALP service and a conforming fake service used for ACP client tests must both implement it exactly as described. provider.status and service.capabilities are new discovery operations required by this interface; the HTTP paths given below are the concrete binding a fake service and the real AALP service must both implement, but a different transport (e.g. a local IPC form) could replace them in a later interface_version without changing the operation names, fields, or outcome semantics documented here.",
+    "reserved_path_prefix": "_aalp",
+    "reserved_path_prefix_rule": "No provider id may begin with '_'. This keeps discovery paths under /_aalp/v1/... from ever colliding with request.forward's /{provider_id}/... passthrough paths."
+  },
+
+  "scheduling_model": {
+    "model": "submitted-request-fifo",
+    "description": "Requests are served strictly in the order they are submitted to AALP, globally, independent of which logical flow/caller/agent submitted them. There is no round robin, no priority, no per-agent fairness, and no idle reservation of a future request's turn.",
+    "flow_id": {
+      "field": "X-Aalp-Flow-Id request header (request.forward only)",
+      "required": false,
+      "semantics": "A purely optional audit/grouping label. It confers no scheduling priority and does not let anything reserve capacity for a later, not-yet-submitted request. Two requests sharing the same flow_id are not guaranteed to run adjacently, and a request with no flow_id is scheduled exactly like one that has it."
+    },
+    "renewal_operation": null,
+    "renewal_operation_notes": "Interface v1 defines no renewal, lease-extension, or open-ended reservation operation of any kind. A caller cannot reserve a lane slot ahead of submitting the request that will use it.",
+    "concurrency_bound": "Per active provider's declared concurrency_limit, discoverable via provider.status. The default 'ci' provider is concurrency_limit 1 (single-flight): AALP never starts a new upstream request for a provider beyond that provider's declared ceiling, and a caller's local timeout never by itself frees a slot that a not-yet-confirmed-closed upstream operation may still be occupying."
+  },
+
+  "outcomes": {
+    "description": "The closed set of outcomes request.forward may report, reusing aalp.errors.Outcome verbatim. No cross-protocol client should ever need to handle a value outside this set for request.forward, and no future v1.x addition may repurpose one of these values to mean something else.",
+    "values": {
+      "success": {
+        "meaning": "The request reached the provider and a response was read back completely. The upstream HTTP status code (e.g. a provider-side 4xx/5xx) is preserved as-is in the response and is NOT itself a non-success AALP outcome — AALP classifies only transport-level results, never the provider's own application-level response.",
+        "response_status_code": "passthrough (identical to the upstream response's status code)"
+      },
+      "unavailable": {
+        "meaning": "The target provider id is unknown or is currently marked inactive (providers/*.json 'active': false). No upstream network attempt was made.",
+        "response_status_code": 503
+      },
+      "queue_timeout": {
+        "meaning": "The request could not be admitted (FIFO scheduling admission, or provider lane admission) before its queue-timeout budget elapsed. No upstream network attempt was made.",
+        "response_status_code": 504
+      },
+      "compression_timeout": {
+        "meaning": "An upstream network attempt was made and a connection-level timeout occurred while sending the request or reading the response (the upstream's own per-request timeout budget, distinct from the queue-wait budget).",
+        "response_status_code": 504
+      },
+      "total_timeout": {
+        "meaning": "The request's overall (queue + upstream) timeout budget elapsed. May occur either before an upstream attempt started (if admission alone exhausted the budget) or immediately after a lane slot was confirmed idle before any attempt was made.",
+        "response_status_code": 504
+      },
+      "invalid_response": {
+        "meaning": "An upstream network attempt was made and a connection was established, but the response could not be read/parsed as a well-formed HTTP response.",
+        "response_status_code": 502
+      },
+      "upstream_error": {
+        "meaning": "An upstream network attempt failed at the connection/transport level (DNS, TCP, TLS, or protocol-level failure) before any response was read.",
+        "response_status_code": 502
+      }
+    }
+  },
+
+  "operations": {
+    "service.capabilities": {
+      "summary": "Discover AALP's interface version and capability set.",
+      "http_binding": { "method": "GET", "path": "/_aalp/v1/capabilities" },
+      "request": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "required": ["service", "interface_version", "capabilities"],
+        "properties": {
+          "service": { "const": "aalp" },
+          "interface_version": { "type": "integer", "minimum": 1 },
+          "capabilities": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "See top-level 'capabilities'. Absence of a capability string means a client must not assume that behavior is supported, even if it appears elsewhere in this document as a v1 concept (e.g. 'request.batch' is deliberately never present)."
+          }
+        }
+      },
+      "outcomes": {
+        "note": "Not modeled with the request.forward Outcome enum. A reachable AALP service always returns 200 with the body above; only a transport-level failure to reach the service at all (connection refused, etc.) is possible, and is not an AALP-level outcome."
+      }
+    },
+
+    "provider.status": {
+      "summary": "Discover provider availability, concurrency state, and accepted request shape, so a client never needs to read providers/*.json directly.",
+      "http_binding": {
+        "list": { "method": "GET", "path": "/_aalp/v1/providers" },
+        "single": { "method": "GET", "path": "/_aalp/v1/providers/{provider_id}" }
+      },
+      "request": {
+        "path_parameters": {
+          "provider_id": {
+            "type": "string",
+            "required": false,
+            "description": "When present (single form), scopes the response to one provider. When absent (list form), returns every provider AALP has loaded, active or not."
+          }
+        }
+      },
+      "provider_status_object": {
+        "type": "object",
+        "required": [
+          "id", "display_name", "active", "concurrency_limit",
+          "in_flight", "queued", "idle", "idle_seconds", "accepted_paths"
+        ],
+        "properties": {
+          "id": { "type": "string", "description": "Provider id, e.g. 'ci'." },
+          "display_name": { "type": "string" },
+          "active": { "type": "boolean", "description": "Whether request.forward will attempt this provider at all; false yields outcome 'unavailable'." },
+          "concurrency_limit": { "type": "integer", "minimum": 1, "description": "Maximum simultaneous in-flight upstream requests AALP will ever hold open for this provider." },
+          "in_flight": { "type": "integer", "minimum": 0, "description": "Currently held provider-lane leases (upstream requests in progress, including quarantined/unconfirmed-closed ones)." },
+          "queued": { "type": "integer", "minimum": 0, "description": "Requests currently waiting in this provider's FIFO lane." },
+          "idle": { "type": "boolean" },
+          "idle_seconds": { "type": "number", "minimum": 0 },
+          "accepted_paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "The exact upstream request paths request.forward will accept for this provider (the second path segment onward). Any other path yields outcome 'unavailable' for that provider."
+          }
+        },
+        "additionalProperties": false,
+        "explicitly_excluded_fields": [
+          "endpoint (AALP-internal upstream URL; not needed to use request.forward, and not exposed)",
+          "client (AALP-internal HTTP client selection; implementation-private)",
+          "any credential or credential-existence field"
+        ]
+      },
+      "response": {
+        "list_form": {
+          "type": "object",
+          "required": ["providers"],
+          "properties": {
+            "providers": {
+              "type": "array",
+              "items": { "$ref": "#operations/provider.status/provider_status_object" }
+            }
+          }
+        },
+        "single_form": {
+          "success": { "$ref": "#operations/provider.status/provider_status_object" },
+          "not_found": {
+            "status_code": 404,
+            "body": {
+              "type": "object",
+              "required": ["error", "provider_id"],
+              "properties": {
+                "error": { "const": "provider_not_found" },
+                "provider_id": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "outcomes": {
+        "note": "Not modeled with the request.forward Outcome enum; plain HTTP 200 / 404 as above."
+      }
+    },
+
+    "request.forward": {
+      "summary": "Submit one provider request and receive a documented outcome. The only operation that talks to a provider's upstream API.",
+      "http_binding": {
+        "method": "any (forwarded verbatim to the provider)",
+        "path": "/{provider_id}/{upstream_path}",
+        "path_notes": "The first '/'-delimited path segment names the target provider id and is stripped before forwarding; everything after it must exactly match one of that provider's accepted_paths (see provider.status)."
+      },
+      "request": {
+        "type": "object",
+        "properties": {
+          "provider_id": { "type": "string", "description": "Taken from the path, not a header or body field." },
+          "method": { "type": "string" },
+          "path": { "type": "string", "description": "Must be one of the target provider's accepted_paths." },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "properties": {
+              "X-Aalp-Flow-Id": {
+                "type": "string",
+                "description": "Optional. See scheduling_model.flow_id. Never required, never a scheduling reservation."
+              }
+            },
+            "description": "Forwarded upstream verbatim, except the provider's own declared auth header, which AALP overwrites with the credential it holds; a client must never attempt to set that header itself to authenticate with the provider."
+          },
+          "body": {
+            "type": "string",
+            "format": "binary",
+            "description": "Raw request body, forwarded upstream byte-for-byte unmodified on outcome 'success'."
+          }
+        },
+        "required": ["provider_id", "method", "path"]
+      },
+      "response": {
+        "on_outcome_success": {
+          "status_code": "passthrough (see outcomes.values.success)",
+          "headers": "passthrough (upstream response headers, verbatim) plus X-Aalp-Outcome: success",
+          "body": "passthrough (upstream response body, verbatim)"
+        },
+        "on_other_outcome": {
+          "status_code": "per outcomes.values.<outcome>.response_status_code",
+          "headers": { "X-Aalp-Outcome": "the outcome value, e.g. 'queue_timeout'" },
+          "body": {
+            "type": "object",
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "type": "string", "enum": [
+                "unavailable", "queue_timeout", "compression_timeout",
+                "total_timeout", "invalid_response", "upstream_error"
+              ]},
+              "message": { "type": "string", "description": "Non-normative diagnostic text; clients must key behavior off 'outcome', never off this string." }
+            }
+          }
+        },
+        "x_aalp_outcome_header": {
+          "requirement_level": "REQUIRED in interface v1",
+          "rationale": "On outcome 'success', AALP passes the upstream status code through verbatim — including a provider-side 4xx/5xx, which is a valid AALP-level success. Status code alone therefore cannot disambiguate an AALP-level failure (e.g. 502 upstream_error) from a provider that itself happened to return 502. X-Aalp-Outcome removes that ambiguity and must be present on every request.forward response, success or not."
+        }
+      },
+      "possible_outcomes": [
+        "success", "unavailable", "queue_timeout", "compression_timeout",
+        "total_timeout", "invalid_response", "upstream_error"
+      ]
+    }
+  },
+
+  "compatibility": {
+    "versioning": "Interface major versions are protocol-local to AALP; they need not match ACP's or ADP's interface version numbers.",
+    "current_version": 1,
+    "stays_within_current_major_version_when_all_of": [
+      "existing valid requests remain valid",
+      "existing outcomes retain their documented meaning",
+      "existing clients keep working without adopting any new capability",
+      "new fields are optional and/or gated behind a new capability string",
+      "service.capabilities exposes any newly added capability"
+    ],
+    "requires_a_new_major_version_when_any_of": [
+      "an operation or field is removed or renamed",
+      "an existing operation's or outcome's semantics change incompatibly",
+      "a previously valid request becomes invalid",
+      "an outcome's meaning changes",
+      "authentication/bootstrap semantics change incompatibly"
+    ]
+  }
+}
