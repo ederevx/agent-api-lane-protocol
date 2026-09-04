@@ -352,13 +352,25 @@ class ConformanceMixin:
         self.assertEqual(payload["outcome"], "unavailable")
         self.assertIn("message", payload)
 
-    # -- request.queue: Stage 1 singleton parity with request.forward -------
+    # -- request.queue: singleton parity with request.forward ---------------
+
+    @staticmethod
+    def _queue_envelope(member_block: str = "solo-member-block") -> bytes:
+        # §11/§13: a queue-of-one still uses the same self-describing
+        # envelope shape as a real multi-member generation -- no separate
+        # single/multi instruction set.
+        return json.dumps({
+            "shared": {"content": "__SENTINEL__"},
+            "content_path": ["content"],
+            "member_block": member_block,
+            "member_join": "\n\n",
+            "count_template": "ACP-QUEUE-MEMBER-COUNT: {member_count}",
+        }).encode("utf-8")
 
     def test_queue_singleton_matches_forward_behavior(self) -> None:
-        # Stage 1 scope (agent_protocols_v1_queue_coalescing_adjustment
-        # _metadata_v1.md §31 migration gate): request.queue with no real
-        # contention must be byte-for-byte equivalent to request.forward,
-        # plus the two generation-metadata headers, on both backends.
+        # §31 migration gate: request.queue with no real contention must
+        # be byte-for-byte equivalent to request.forward, plus the two
+        # generation-metadata headers, on both backends.
         self.driver.set_providers([
             {"id": "ci", "display_name": "CI", "concurrency_limit": 1,
              "accepted_paths": ["/v1/messages"]},
@@ -367,7 +379,7 @@ class ConformanceMixin:
             "ci", "/v1/messages", status=201, body=b'{"ok":true}')
 
         status, headers, body = self.driver.submit_queue_member(
-            "ci", "queue-key-1", "POST", "/v1/messages")
+            "ci", "queue-key-1", "POST", "/v1/messages", body=self._queue_envelope())
 
         self.assertEqual(status, 201)
         self.assertEqual(headers["X-Aalp-Outcome"], "success")
@@ -485,6 +497,204 @@ class ConformanceMixin:
             "same time instead of being serialized")
         self.assertEqual(results["A"][0], 200)
         self.assertEqual(results["B"][0], 200)
+
+    # -- request.queue: real contention coalescing (Stage 3) ----------------
+
+    def test_concurrent_queue_submissions_with_same_key_genuinely_coalesce(self) -> None:
+        # §6/§8: while a provider is occupied, additional request.queue
+        # submissions sharing one queue_key join the same OPEN generation
+        # instead of each triggering their own physical call -- proven by
+        # both getting the identical generation id, the true member
+        # count, and the one physical response, on both backends.
+        self.driver.set_providers([
+            {"id": "prov", "display_name": "Prov", "concurrency_limit": 1,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+        self.driver.program_success(
+            "prov", "/v1/messages", body=b"occupier-response", delay=0.3)
+        self.driver.program_success(
+            "prov", "/v1/messages", body=b"coalesced-response")
+
+        def occupy() -> None:
+            self.driver.forward("prov", "POST", "/v1/messages", flow_id="occupier")
+
+        occupier_thread = threading.Thread(target=occupy)
+        occupier_thread.start()
+        time.sleep(0.05)  # let the occupier take the lane first
+
+        results: dict[str, tuple] = {}
+
+        def submit(marker: str) -> None:
+            results[marker] = self.driver.submit_queue_member(
+                "prov", "shared-key", "POST", "/v1/messages",
+                body=self._queue_envelope(f"block-{marker}"), flow_id=f"flow-{marker}")
+
+        threads = [threading.Thread(target=submit, args=(marker,)) for marker in ("A", "B")]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.05)
+        for thread in threads:
+            thread.join(timeout=5)
+        occupier_thread.join(timeout=5)
+
+        status_a, headers_a, body_a = results["A"]
+        status_b, headers_b, body_b = results["B"]
+        self.assertEqual(status_a, 200)
+        self.assertEqual(status_b, 200)
+        self.assertEqual(body_a, b"coalesced-response")
+        self.assertEqual(body_b, b"coalesced-response")
+        self.assertEqual(
+            headers_a["X-Aalp-Queue-Generation-Id"],
+            headers_b["X-Aalp-Queue-Generation-Id"])
+        self.assertEqual(headers_a["X-Aalp-Queue-Member-Count"], "2")
+        self.assertEqual(headers_b["X-Aalp-Queue-Member-Count"], "2")
+
+    def test_incompatible_queue_key_does_not_jump_or_get_jumped(self) -> None:
+        # §8: a request with a different queue_key must not let a later
+        # same-key request jump it, and must not itself be able to jump
+        # an earlier-arrived generation either -- submission order of
+        # each key's *leader* is what Lane's own FIFO ticket order
+        # preserves, with no separate scheduler involved.
+        self.driver.set_providers([
+            {"id": "prov", "display_name": "Prov", "concurrency_limit": 1,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+        self.driver.program_success(
+            "prov", "/v1/messages", body=b"occupier-response", delay=0.2)
+        self.driver.program_success(
+            "prov", "/v1/messages", body=b"key-a-response")
+        self.driver.program_success(
+            "prov", "/v1/messages", body=b"key-b-response")
+
+        def occupy() -> None:
+            self.driver.forward("prov", "POST", "/v1/messages", flow_id="occupier")
+
+        occupier_thread = threading.Thread(target=occupy)
+        occupier_thread.start()
+        time.sleep(0.05)
+
+        finished: list[str] = []
+        lock = threading.Lock()
+
+        def submit(marker: str, queue_key: str) -> None:
+            self.driver.submit_queue_member(
+                "prov", queue_key, "POST", "/v1/messages",
+                body=self._queue_envelope(marker), flow_id=f"flow-{marker}")
+            with lock:
+                finished.append(marker)
+
+        # A becomes key "a"'s leader first (its ticket is taken first);
+        # B is a different key, so it becomes its own leader too, one
+        # tick later -- it must not overtake A's already-queued ticket.
+        thread_a = threading.Thread(target=submit, args=("A", "key-a"))
+        thread_a.start()
+        time.sleep(0.05)
+        thread_b = threading.Thread(target=submit, args=("B", "key-b"))
+        thread_b.start()
+
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+        occupier_thread.join(timeout=5)
+
+        self.assertEqual(finished, ["A", "B"])
+
+    def test_provider_concurrency_above_one_runs_two_generations_at_once(self) -> None:
+        # §24: physical concurrency is counted in queue generations, not
+        # logical members -- a concurrency_limit=2 provider must let two
+        # *different* queue_key generations execute at the same time,
+        # not serialize them behind a single system-wide queue mechanism.
+        self.driver.set_providers([
+            {"id": "prov", "display_name": "Prov", "concurrency_limit": 2,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+        self.driver.program_success("prov", "/v1/messages", body=b"A", delay=0.2)
+        self.driver.program_success("prov", "/v1/messages", body=b"B", delay=0.2)
+
+        results: dict[str, tuple] = {}
+
+        def submit(marker: str, queue_key: str) -> None:
+            results[marker] = self.driver.submit_queue_member(
+                "prov", queue_key, "POST", "/v1/messages",
+                body=self._queue_envelope(marker), flow_id=f"flow-{marker}")
+
+        threads = [
+            threading.Thread(target=submit, args=(marker, f"key-{marker}"))
+            for marker in ("A", "B")
+        ]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + 2.0
+        observed_both_in_flight = False
+        while time.monotonic() < deadline:
+            _, payload = self.driver.provider_status("prov")
+            if payload["in_flight"] == 2:
+                observed_both_in_flight = True
+                break
+            time.sleep(0.01)
+
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertTrue(
+            observed_both_in_flight,
+            "expected two different queue_key generations to run at the "
+            "same time instead of being serialized")
+        self.assertEqual(results["A"][0], 200)
+        self.assertEqual(results["B"][0], 200)
+
+    def test_queue_member_bound_seals_generation_and_opens_a_new_one(self) -> None:
+        # §22-§23: a generation seals once it holds max_queue_members
+        # (this fixture's own gateway/service default is 4) even though
+        # the provider is still occupied -- further arrivals for the same
+        # queue_key open a second, later generation instead of growing
+        # the first without bound.
+        self.driver.set_providers([
+            {"id": "prov", "display_name": "Prov", "concurrency_limit": 1,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+        self.driver.program_success(
+            "prov", "/v1/messages", body=b"occupier-response", delay=0.4)
+        self.driver.program_success("prov", "/v1/messages", body=b"first-gen")
+        self.driver.program_success("prov", "/v1/messages", body=b"second-gen")
+
+        def occupy() -> None:
+            self.driver.forward("prov", "POST", "/v1/messages", flow_id="occupier")
+
+        occupier_thread = threading.Thread(target=occupy)
+        occupier_thread.start()
+        time.sleep(0.05)
+
+        results: dict[str, tuple] = {}
+
+        def submit(marker: str) -> None:
+            results[marker] = self.driver.submit_queue_member(
+                "prov", "shared-key", "POST", "/v1/messages",
+                body=self._queue_envelope(f"block-{marker}"), flow_id=f"flow-{marker}")
+
+        markers = ["A", "B", "C", "D", "E"]  # 4 = default max_queue_members
+        threads = [threading.Thread(target=submit, args=(marker,)) for marker in markers]
+        for thread in threads:
+            thread.start()
+            time.sleep(0.03)
+        for thread in threads:
+            thread.join(timeout=5)
+        occupier_thread.join(timeout=5)
+
+        generation_ids = {
+            marker: results[marker][1]["X-Aalp-Queue-Generation-Id"] for marker in markers
+        }
+        member_counts = {
+            marker: results[marker][1]["X-Aalp-Queue-Member-Count"] for marker in markers
+        }
+        first_four = {generation_ids[m] for m in ("A", "B", "C", "D")}
+        self.assertEqual(len(first_four), 1, "first four submissions must share one generation")
+        for marker in ("A", "B", "C", "D"):
+            self.assertEqual(member_counts[marker], "4")
+        self.assertNotEqual(
+            generation_ids["E"], generation_ids["A"],
+            "the 5th submission must have sealed a new generation, not grown the first")
+        self.assertEqual(member_counts["E"], "1")
 
     def test_completing_earlier_flows_request_leaves_no_idle_reservation(self) -> None:
         # §35 acceptance #2, explicit: completion of A1 (flow-A) must

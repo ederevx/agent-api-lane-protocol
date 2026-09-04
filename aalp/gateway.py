@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from dataclasses import dataclass, field
+
 from . import audit
 from . import credential as credential_module
 from . import forwarder
@@ -45,8 +47,20 @@ from . import registry
 from .errors import AalpResult, Outcome
 from .ingress import Handler
 from .lane import Lane, LaneTimeout
-from .queue import QueueGeneration, QueueMember, new_generation_id
+from .queue import (
+    QueueEnvelopeError,
+    QueueGeneration,
+    QueueGenerationState,
+    QueueMember,
+    new_generation_id,
+)
 from .registry import ProviderDefinition
+
+# §22's primary Stage 3 bound: a generation seals once it holds this many
+# members, whether or not the provider is still occupied. The byte/output-
+# budget bounds §22 also describes are deliberately deferred -- member
+# count is the only one with an unambiguous, payload-blind measurement.
+_DEFAULT_MAX_QUEUE_MEMBERS = 4
 
 _STATUS_BY_OUTCOME: dict[Outcome, int] = {
     Outcome.UNAVAILABLE: 503,
@@ -101,6 +115,20 @@ def _header(headers: dict[str, str], name: str) -> str | None:
     return None
 
 
+@dataclass
+class _QueueSlot:
+    """Gateway-private coordination state for one OPEN-or-later
+    generation -- kept out of `aalp/queue.py` because `done_event`/
+    `result` are concurrency plumbing, not part of the generation's own
+    state machine. The leader (the thread that created this slot) drives
+    `generation` to DONE and publishes `result` here exactly once; every
+    joiner blocks on `done_event` and then reads `result`."""
+
+    generation: QueueGeneration
+    done_event: threading.Event = field(default_factory=threading.Event)
+    result: AalpResult | None = None
+
+
 class Gateway:
     """Owns each provider's lane state and drives one request through
     admission, forwarding, and audit."""
@@ -112,12 +140,15 @@ class Gateway:
         clock: Callable[[], float] = time.monotonic,
         lease_seconds: float = 30.0,
         connection_factory: forwarder.ConnectionFactory | None = None,
+        max_queue_members: int | None = None,
     ) -> None:
         self.providers_dir = providers_dir
         self.root = root
         self.clock = clock
         self.lease_seconds = lease_seconds
         self.connection_factory = connection_factory
+        self.max_queue_members = max_queue_members or int(
+            os.environ.get("AALP_MAX_QUEUE_MEMBERS", _DEFAULT_MAX_QUEUE_MEMBERS))
 
         self.providers = registry.load_providers(providers_dir)
         self.provider_lanes: dict[str, Lane] = {
@@ -129,6 +160,12 @@ class Gateway:
             for provider_id, provider in self.providers.items()
             if provider.active
         }
+        # Keyed by (provider_id, queue_key) -- the only OPEN generation a
+        # new arrival may still join. Removed the moment a generation
+        # seals (bound reached, or its leader was admitted to the Lane),
+        # never mutated concurrently without holding `_queue_lock`.
+        self._queue_lock = threading.Lock()
+        self._open_queue_slots: dict[tuple[str, str], _QueueSlot] = {}
 
         self.migration_status: migrate_ci.MigrationStatus | None = None
         # Generic over provider id everywhere else in this module; this
@@ -227,12 +264,39 @@ class Gateway:
             return self._audit_and_return(
                 provider_id, flow_id, path, result, start, queue_wait_ms)
 
+        result = self._execute_admitted(
+            provider, provider_id, lane, flow_id, provider_token,
+            method, path, headers, body)
+
+        return self._audit_and_return(
+            provider_id, flow_id, path, result, start, queue_wait_ms)
+
+    def _execute_admitted(
+        self,
+        provider: ProviderDefinition,
+        provider_id: str,
+        lane: Lane,
+        holder: str,
+        token: str,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> AalpResult:
+        """Shared body of the post-admission pipeline: heartbeat while
+        forwarding, then closed/quarantine release (§19). `holder`/
+        `token` are whatever identity was used to `lane.acquire()` this
+        slot -- a flow id from `handle()`'s per-flow path, or a
+        generation id from `handle_queue()`'s per-generation leader path
+        -- so this one implementation serves both without duplicating
+        the credential-read/heartbeat/forward/quarantine logic.
+        """
         stop_heartbeat = threading.Event()
         interval = self.lease_seconds / 3
 
         def _heartbeat_loop() -> None:
             while not stop_heartbeat.wait(interval):
-                lane.heartbeat(flow_id, provider_token)
+                lane.heartbeat(holder, token)
 
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop, daemon=True)
@@ -259,15 +323,166 @@ class Gateway:
             heartbeat_thread.join()
 
         if closed:
-            lane.release(flow_id, provider_token)
+            lane.release(holder, token)
         # else: leave the lease in place. This *is* §19 quarantine — an
         # unconfirmed close means we cannot prove the upstream operation
         # actually stopped, so the slot is left held until its own TTL
         # (lease_seconds) reclaims it, rather than building a second
         # mechanism for the same guarantee Lane already provides.
+        return result
 
-        return self._audit_and_return(
+    def _immediate_queue_failure(
+        self,
+        provider_id: str,
+        queue_key: str,
+        flow_id: str,
+        path: str,
+        start: float,
+        result: AalpResult,
+    ) -> tuple[AalpResult, QueueGeneration]:
+        """A logical member that never joined any generation at all --
+        its own deadline was already past, or its payload envelope was
+        malformed. Still returns a (terminal, empty) generation so every
+        caller gets the same response shape regardless of outcome."""
+        generation = QueueGeneration(
+            generation_id=new_generation_id(),
+            provider_id=provider_id,
+            queue_key=queue_key,
+        )
+        generation.seal()
+        generation.mark_in_flight()
+        generation.mark_done()
+        queue_wait_ms = (self.clock() - start) * 1000
+        audited = self._audit_and_return(
             provider_id, flow_id, path, result, start, queue_wait_ms)
+        return audited, generation
+
+    def _finish_leader(
+        self,
+        slot: _QueueSlot,
+        result: AalpResult,
+        provider_id: str,
+        flow_id: str,
+        path: str,
+        start: float,
+        queue_wait_ms: float,
+    ) -> tuple[AalpResult, QueueGeneration]:
+        """Leader-only: drive the shared generation the rest of the way
+        to DONE (whatever state a failure path left it in), publish the
+        physical result for every joiner, and wake them."""
+        generation = slot.generation
+        if generation.state is QueueGenerationState.OPEN:
+            generation.seal()
+        if generation.state is QueueGenerationState.READY:
+            generation.mark_in_flight()
+        if generation.state is QueueGenerationState.IN_FLIGHT:
+            generation.mark_done()
+        slot.result = result
+        slot.done_event.set()
+        audited = self._audit_and_return(
+            provider_id, flow_id, path, result, start, queue_wait_ms)
+        return audited, generation
+
+    def _close_open_slot(self, provider_id: str, queue_key: str, slot: _QueueSlot) -> None:
+        with self._queue_lock:
+            key = (provider_id, queue_key)
+            if self._open_queue_slots.get(key) is slot:
+                del self._open_queue_slots[key]
+            if slot.generation.state is QueueGenerationState.OPEN:
+                slot.generation.seal()
+
+    def _run_leader(
+        self,
+        slot: _QueueSlot,
+        provider_id: str,
+        queue_key: str,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        flow_id: str,
+        start: float,
+        total_deadline: float,
+        queue_deadline: float,
+    ) -> tuple[AalpResult, QueueGeneration]:
+        """The thread that opened `slot.generation` immediately queues
+        for the provider's Lane under the generation's own id (so an
+        idle provider incurs zero added latency, §5, and Lane's own FIFO
+        ticket order -- not a separate scheduler -- is what keeps
+        generation dispatch order correct, §8). Once admitted, it seals
+        membership (preventing further joins, §7), mechanically
+        assembles the physical body (§10-§12), executes it, and wakes
+        every joiner that appended while it waited.
+        """
+        generation = slot.generation
+        provider = self.providers.get(provider_id)
+        if provider is None or not provider.active:
+            self._close_open_slot(provider_id, queue_key, slot)
+            result = AalpResult(
+                Outcome.UNAVAILABLE, message=f"provider {provider_id!r} is not available")
+            queue_wait_ms = (self.clock() - start) * 1000
+            return self._finish_leader(
+                slot, result, provider_id, flow_id, path, start, queue_wait_ms)
+
+        lane = self.provider_lanes[provider_id]
+        remaining = queue_deadline - self.clock()
+        provider_token: str | None = None
+        result: AalpResult | None = None
+        if remaining <= 0:
+            result = AalpResult(Outcome.QUEUE_TIMEOUT)
+        else:
+            try:
+                provider_token = lane.acquire(
+                    generation.generation_id, timeout_seconds=remaining)
+            except LaneTimeout:
+                result = AalpResult(Outcome.QUEUE_TIMEOUT)
+
+        self._close_open_slot(provider_id, queue_key, slot)
+        queue_wait_ms = (self.clock() - start) * 1000
+
+        if provider_token is not None and self.clock() >= total_deadline:
+            lane.release(generation.generation_id, provider_token)
+            provider_token = None
+            result = AalpResult(Outcome.TOTAL_TIMEOUT)
+
+        if provider_token is not None:
+            try:
+                physical_body = generation.build_physical_body()
+            except QueueEnvelopeError as error:
+                lane.release(generation.generation_id, provider_token)
+                result = AalpResult(Outcome.UNAVAILABLE, message=str(error))
+            else:
+                generation.mark_in_flight()
+                result = self._execute_admitted(
+                    provider, provider_id, lane, generation.generation_id,
+                    provider_token, method, path, headers, physical_body)
+
+        return self._finish_leader(
+            slot, result, provider_id, flow_id, path, start, queue_wait_ms)
+
+    def _wait_as_joiner(
+        self,
+        slot: _QueueSlot,
+        provider_id: str,
+        path: str,
+        flow_id: str,
+        start: float,
+        total_deadline: float,
+    ) -> tuple[AalpResult, QueueGeneration]:
+        """Blocks on the leader's completion signal, bounded by this
+        member's own total deadline (§21: coalescing must not reset or
+        extend a logical request's own deadline) -- never on the Lane
+        itself, which only the leader ever touches."""
+        remaining = total_deadline - self.clock()
+        if remaining > 0:
+            slot.done_event.wait(remaining)
+        if slot.done_event.is_set():
+            result = slot.result
+        else:
+            result = AalpResult(Outcome.TOTAL_TIMEOUT)
+        queue_wait_ms = (self.clock() - start) * 1000
+        audited = self._audit_and_return(
+            provider_id, flow_id, path, result, start, queue_wait_ms)
+        return audited, slot.generation
 
     def handle_queue(
         self,
@@ -280,28 +495,67 @@ class Gateway:
         headers: dict[str, str],
         body: bytes,
     ) -> tuple[AalpResult, QueueGeneration]:
-        """`request.queue` entry point.
-
-        Stage 1 scope only (see aalp/queue.py's module docstring): every
-        call here builds and seals a generation of exactly one member,
-        then delegates admission/forwarding/audit to the unchanged
-        `handle()` pipeline -- there is no real accumulation yet. This
-        keeps the singleton path byte-for-byte behaviorally equivalent
-        to `request.forward`, which is what the adjustment's §31
-        migration gate requires before Stage 3 adds genuine multi-member
-        coalescing on top of this same generation object.
+        """`request.queue` entry point: real multi-member coalescing
+        (§6-§13). The first caller to open a generation for
+        `(provider_id, queue_key)` becomes its "leader" (see
+        `_run_leader`); any other caller whose `(provider_id, queue_key)`
+        matches an already-OPEN generation becomes a "joiner" (see
+        `_wait_as_joiner`), appending its member and then blocking on
+        that generation's own completion signal instead of the Lane.
+        `body` is expected to be the JSON-encoded self-describing
+        envelope `acp/queue_codec.py` builds (`shared`/`content_path`/
+        `member_block`/`member_join`/`count_template`) -- AALP never
+        interprets its contents beyond that shape (§9, §11).
         """
-        generation = QueueGeneration(
-            generation_id=new_generation_id(),
-            provider_id=provider_id,
-            queue_key=queue_key,
-        )
-        generation.append(QueueMember(member_id=member_id))
-        generation.seal()
-        generation.mark_in_flight()
-        result = self.handle(flow_id, provider_id, method, path, headers, body)
-        generation.mark_done()
-        return result, generation
+        start = self.clock()
+        provider = self.providers.get(provider_id)
+        total_deadline = start + _resolve_timeout(
+            provider, "total_timeout_seconds", "ACP_TOTAL_TIMEOUT", 120)
+        queue_deadline = start + _resolve_timeout(
+            provider, "queue_timeout_seconds", "ACP_QUEUE_TIMEOUT", 30)
+
+        if self.clock() >= total_deadline:
+            return self._immediate_queue_failure(
+                provider_id, queue_key, flow_id, path, start,
+                AalpResult(Outcome.TOTAL_TIMEOUT))
+
+        try:
+            payload = json.loads(body) if body else {}
+            if not isinstance(payload, dict):
+                raise ValueError("queue member payload must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as error:
+            result = AalpResult(
+                Outcome.UNAVAILABLE,
+                message=f"malformed queue member payload: {error}")
+            return self._immediate_queue_failure(
+                provider_id, queue_key, flow_id, path, start, result)
+
+        member = QueueMember(member_id=member_id, payload=payload)
+        slot_key = (provider_id, queue_key)
+        is_leader = False
+        with self._queue_lock:
+            slot = self._open_queue_slots.get(slot_key)
+            if slot is None:
+                generation = QueueGeneration(
+                    generation_id=new_generation_id(),
+                    provider_id=provider_id,
+                    queue_key=queue_key,
+                )
+                generation.append(member)
+                slot = _QueueSlot(generation=generation)
+                self._open_queue_slots[slot_key] = slot
+                is_leader = True
+            else:
+                slot.generation.append(member)
+                if slot.generation.member_count >= self.max_queue_members:
+                    slot.generation.seal()
+                    del self._open_queue_slots[slot_key]
+
+        if is_leader:
+            return self._run_leader(
+                slot, provider_id, queue_key, method, path, headers, flow_id,
+                start, total_deadline, queue_deadline)
+        return self._wait_as_joiner(slot, provider_id, path, flow_id, start, total_deadline)
 
     def _provider_status_object(self, provider: ProviderDefinition) -> dict[str, Any]:
         lane = self.provider_lanes.get(provider.id)
