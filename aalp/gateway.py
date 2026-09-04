@@ -543,8 +543,18 @@ class Gateway:
                 )
                 generation.append(member)
                 slot = _QueueSlot(generation=generation)
-                self._open_queue_slots[slot_key] = slot
                 is_leader = True
+                # §22: a generation seals as soon as it holds
+                # max_queue_members, even if that happens on its very
+                # first (leader) member -- max_queue_members=1 must mean
+                # every member gets its own singleton generation, never
+                # silently waiting for a joiner that would push it over
+                # the configured bound. Only register the slot as OPEN
+                # (joinable) if it is genuinely still under the cap.
+                if generation.member_count >= self.max_queue_members:
+                    generation.seal()
+                else:
+                    self._open_queue_slots[slot_key] = slot
             else:
                 slot.generation.append(member)
                 if slot.generation.member_count >= self.max_queue_members:
