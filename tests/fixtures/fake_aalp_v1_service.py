@@ -30,6 +30,7 @@ Test setup, in order:
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 import urllib.parse
@@ -43,6 +44,7 @@ CAPABILITIES = [
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
+    "request.queue",
 ]
 
 # Mirrors contract.json's outcomes.values.<outcome>.response_status_code.
@@ -103,6 +105,18 @@ class ForwardResult:
     status: int
     headers: dict[str, str]
     body: bytes
+
+
+@dataclass
+class QueueForwardResult(ForwardResult):
+    """request.queue's result: identical to ForwardResult plus the two
+    generation-metadata headers contract.json requires on its responses.
+    Stage 1 only -- generation_id/member_count reflect a singleton
+    generation, not real coalescing (see aalp/queue.py's docstring in
+    the real package)."""
+
+    generation_id: str = ""
+    member_count: int = 1
 
 
 class _ProviderLane:
@@ -275,6 +289,37 @@ class FakeAalpV1Service:
             return self._synthetic_outcome(programmed)
         finally:
             lane.release()
+
+    # -- request.queue ----------------------------------------------------
+
+    def submit_queue_member(
+        self,
+        provider_id: str,
+        queue_key: str,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+        member_id: str | None = None,
+    ) -> QueueForwardResult:
+        """Stage 1: always a singleton generation, delegating straight to
+        forward() -- see contract.json's request.queue operation notes.
+        `queue_key`/`member_id` are accepted for shape fidelity but not
+        yet used for any real accumulation decision."""
+        del queue_key, member_id
+        result = self.forward(provider_id, method, path, headers=headers, body=body)
+        generation_id = secrets.token_hex(8)
+        out_headers = dict(result.headers)
+        out_headers["X-Aalp-Queue-Generation-Id"] = generation_id
+        out_headers["X-Aalp-Queue-Member-Count"] = "1"
+        return QueueForwardResult(
+            outcome=result.outcome,
+            status=result.status,
+            headers=out_headers,
+            body=result.body,
+            generation_id=generation_id,
+            member_count=1,
+        )
 
     @staticmethod
     def _unavailable(message: str) -> ForwardResult:

@@ -45,6 +45,7 @@ from . import registry
 from .errors import AalpResult, Outcome
 from .ingress import Handler
 from .lane import Lane, LaneTimeout
+from .queue import QueueGeneration, QueueMember, new_generation_id
 from .registry import ProviderDefinition
 
 _STATUS_BY_OUTCOME: dict[Outcome, int] = {
@@ -64,6 +65,7 @@ INTERFACE_V1_CAPABILITIES: tuple[str, ...] = (
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
+    "request.queue",
 )
 
 _DISCOVERY_PATH_PREFIX = "_aalp"
@@ -267,6 +269,40 @@ class Gateway:
         return self._audit_and_return(
             provider_id, flow_id, path, result, start, queue_wait_ms)
 
+    def handle_queue(
+        self,
+        flow_id: str,
+        provider_id: str,
+        queue_key: str,
+        member_id: str,
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[AalpResult, QueueGeneration]:
+        """`request.queue` entry point.
+
+        Stage 1 scope only (see aalp/queue.py's module docstring): every
+        call here builds and seals a generation of exactly one member,
+        then delegates admission/forwarding/audit to the unchanged
+        `handle()` pipeline -- there is no real accumulation yet. This
+        keeps the singleton path byte-for-byte behaviorally equivalent
+        to `request.forward`, which is what the adjustment's §31
+        migration gate requires before Stage 3 adds genuine multi-member
+        coalescing on top of this same generation object.
+        """
+        generation = QueueGeneration(
+            generation_id=new_generation_id(),
+            provider_id=provider_id,
+            queue_key=queue_key,
+        )
+        generation.append(QueueMember(member_id=member_id))
+        generation.seal()
+        generation.mark_in_flight()
+        result = self.handle(flow_id, provider_id, method, path, headers, body)
+        generation.mark_done()
+        return result, generation
+
     def _provider_status_object(self, provider: ProviderDefinition) -> dict[str, Any]:
         lane = self.provider_lanes.get(provider.id)
         if lane is not None:
@@ -373,11 +409,27 @@ class Gateway:
             # the header was supplied.
             flow_id = _header(headers, "X-Aalp-Flow-Id") or secrets.token_hex(16)
 
-            result = self.handle(
-                flow_id, provider_id, method, forwarded_path, headers, body)
-
-            response_headers = dict(result.headers)
-            response_headers["X-Aalp-Outcome"] = result.outcome.value
+            queue_key = _header(headers, "X-Aalp-Queue-Key")
+            response_headers: dict[str, str]
+            if queue_key is not None:
+                # request.queue path: Stage 1 always builds a singleton
+                # generation (see handle_queue()'s docstring) -- the
+                # member id has no meaning of its own yet, so it is
+                # synthesized the same way an omitted flow_id is above.
+                member_id = _header(
+                    headers, "X-Aalp-Queue-Member-Id") or secrets.token_hex(16)
+                result, generation = self.handle_queue(
+                    flow_id, provider_id, queue_key, member_id, method,
+                    forwarded_path, headers, body)
+                response_headers = dict(result.headers)
+                response_headers["X-Aalp-Outcome"] = result.outcome.value
+                response_headers["X-Aalp-Queue-Generation-Id"] = generation.generation_id
+                response_headers["X-Aalp-Queue-Member-Count"] = str(generation.member_count)
+            else:
+                result = self.handle(
+                    flow_id, provider_id, method, forwarded_path, headers, body)
+                response_headers = dict(result.headers)
+                response_headers["X-Aalp-Outcome"] = result.outcome.value
 
             if result.outcome is Outcome.SUCCESS:
                 return result.status_code, response_headers, result.body

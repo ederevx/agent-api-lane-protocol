@@ -90,7 +90,8 @@ class CapabilitiesEndpointTest(_TempGatewayCase):
         self.assertEqual(
             payload["capabilities"],
             ["request.forward", "provider.status",
-             "provider.concurrency", "request.timeout_outcomes"])
+             "provider.concurrency", "request.timeout_outcomes",
+             "request.queue"])
 
 
 class ProviderStatusListTest(_TempGatewayCase):

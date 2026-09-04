@@ -168,6 +168,19 @@ class RealBackendDriver:
             request_headers["X-Aalp-Flow-Id"] = flow_id
         return self.adapter(method, f"/{provider_id}{path}", request_headers, body)
 
+    def submit_queue_member(
+        self, provider_id: str, queue_key: str, method: str, path: str, *,
+        headers: dict[str, str] | None = None, body: bytes = b"",
+        flow_id: str | None = "conformance-flow", member_id: str | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        request_headers = dict(headers or {})
+        if flow_id is not None:
+            request_headers["X-Aalp-Flow-Id"] = flow_id
+        request_headers["X-Aalp-Queue-Key"] = queue_key
+        if member_id is not None:
+            request_headers["X-Aalp-Queue-Member-Id"] = member_id
+        return self.adapter(method, f"/{provider_id}{path}", request_headers, body)
+
     def close(self) -> None:
         self._providers_tmp.cleanup()
         self._root_tmp.cleanup()
@@ -223,6 +236,17 @@ class FakeBackendDriver:
         del flow_id
         result = self.service.forward(
             provider_id, method, path, headers=headers or {}, body=body)
+        return result.status, result.headers, result.body
+
+    def submit_queue_member(
+        self, provider_id: str, queue_key: str, method: str, path: str, *,
+        headers: dict[str, str] | None = None, body: bytes = b"",
+        flow_id: str | None = "conformance-flow", member_id: str | None = None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        del flow_id  # same rationale as forward(): audit-only, never read by a conforming fake
+        result = self.service.submit_queue_member(
+            provider_id, queue_key, method, path,
+            headers=headers or {}, body=body, member_id=member_id)
         return result.status, result.headers, result.body
 
     def close(self) -> None:
@@ -327,6 +351,43 @@ class ConformanceMixin:
         payload = json.loads(body)
         self.assertEqual(payload["outcome"], "unavailable")
         self.assertIn("message", payload)
+
+    # -- request.queue: Stage 1 singleton parity with request.forward -------
+
+    def test_queue_singleton_matches_forward_behavior(self) -> None:
+        # Stage 1 scope (agent_protocols_v1_queue_coalescing_adjustment
+        # _metadata_v1.md §31 migration gate): request.queue with no real
+        # contention must be byte-for-byte equivalent to request.forward,
+        # plus the two generation-metadata headers, on both backends.
+        self.driver.set_providers([
+            {"id": "ci", "display_name": "CI", "concurrency_limit": 1,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+        self.driver.program_success(
+            "ci", "/v1/messages", status=201, body=b'{"ok":true}')
+
+        status, headers, body = self.driver.submit_queue_member(
+            "ci", "queue-key-1", "POST", "/v1/messages")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(headers["X-Aalp-Outcome"], "success")
+        self.assertEqual(body, b'{"ok":true}')
+        self.assertIn("X-Aalp-Queue-Generation-Id", headers)
+        self.assertEqual(headers["X-Aalp-Queue-Member-Count"], "1")
+
+    def test_queue_singleton_failure_matches_forward_shape(self) -> None:
+        self.driver.set_providers([
+            {"id": "ci", "display_name": "CI", "concurrency_limit": 1,
+             "accepted_paths": ["/v1/messages"]},
+        ])
+
+        status, headers, body = self.driver.submit_queue_member(
+            "unknown-provider", "queue-key-1", "POST", "/v1/messages")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["X-Aalp-Outcome"], "unavailable")
+        payload = json.loads(body)
+        self.assertEqual(payload["outcome"], "unavailable")
 
     # -- scheduling: submitted-request FIFO ----------------------------------
 
