@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from aalp import maintenance
 from aalp import migrate_ci as migrate_ci_module
 from aalp.audit import read_entries
 from aalp.credential import write_credential
@@ -472,6 +473,88 @@ class IngressAdapterTest(_TempGatewayCase):
 
         self.assertEqual(status, 503)
         self.assertNotIn("X-Aalp-Flow-Token", headers)
+
+
+class MaintenanceModeTest(_TempGatewayCase):
+    def test_flag_present_short_circuits_before_provider_lookup_or_lane(
+        self,
+    ) -> None:
+        # No provider is even written to providers_dir -- an unknown
+        # provider_id would ordinarily yield UNAVAILABLE, but maintenance
+        # mode must pre-empt that check entirely and never reach it.
+        maintenance.enter_maintenance(root=self.root)
+
+        def never_called_connection_factory(provider, timeout):
+            raise AssertionError("forward() must not be reached")
+
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=never_called_connection_factory)
+
+        result = gateway.handle(
+            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+
+        self.assertEqual(result.outcome, Outcome.MAINTENANCE)
+
+    def test_flag_absent_serves_request_normally(self) -> None:
+        _write_provider(self.providers_dir, "prov", concurrency_limit=1)
+        write_credential("prov", "fake-token", root=self.root)
+        fake_conn = FakeConnection(response=FakeResponse(status=200, body=b"ok"))
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: fake_conn)
+
+        result = gateway.handle(
+            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+
+        self.assertTrue(result.ok)
+
+    def test_exiting_maintenance_resumes_normal_service(self) -> None:
+        _write_provider(self.providers_dir, "prov", concurrency_limit=1)
+        write_credential("prov", "fake-token", root=self.root)
+        fake_conn = FakeConnection(response=FakeResponse(status=200, body=b"ok"))
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: fake_conn)
+
+        maintenance.enter_maintenance(root=self.root)
+        blocked = gateway.handle(
+            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+        self.assertEqual(blocked.outcome, Outcome.MAINTENANCE)
+
+        maintenance.exit_maintenance(root=self.root)
+        resumed = gateway.handle(
+            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+        self.assertTrue(resumed.ok)
+
+    def test_ingress_adapter_maps_maintenance_to_503_with_outcome_header(
+        self,
+    ) -> None:
+        maintenance.enter_maintenance(root=self.root)
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: FakeConnection())
+        adapter = gateway.as_ingress_handler()
+
+        status, headers, body = adapter(
+            "POST", "/prov/v1/messages", {}, b"{}")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["X-Aalp-Outcome"], Outcome.MAINTENANCE.value)
+        payload = json.loads(body)
+        self.assertEqual(payload["outcome"], Outcome.MAINTENANCE.value)
+
+    def test_maintenance_short_circuit_is_still_audited(self) -> None:
+        maintenance.enter_maintenance(root=self.root)
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: FakeConnection())
+
+        gateway.handle("flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+
+        entries = read_entries(root=self.root)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["outcome"], Outcome.MAINTENANCE.value)
 
 
 class MigrateCiWiringTest(unittest.TestCase):

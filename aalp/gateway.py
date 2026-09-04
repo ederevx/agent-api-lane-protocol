@@ -40,6 +40,7 @@ from typing import Any, Callable
 from . import audit
 from . import credential as credential_module
 from . import forwarder
+from . import maintenance
 from . import migrate_ci
 from . import registry
 from .errors import AalpResult, Outcome
@@ -54,6 +55,7 @@ _STATUS_BY_OUTCOME: dict[Outcome, int] = {
     Outcome.COMPRESSION_TIMEOUT: 504,
     Outcome.INVALID_RESPONSE: 502,
     Outcome.UPSTREAM_ERROR: 502,
+    Outcome.MAINTENANCE: 503,
 }
 
 # The sole definition of interface v1's capability list — must match
@@ -64,6 +66,7 @@ INTERFACE_V1_CAPABILITIES: tuple[str, ...] = (
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
+    "service.maintenance",
 )
 
 _DISCOVERY_PATH_PREFIX = "_aalp"
@@ -169,6 +172,17 @@ class Gateway:
         body: bytes,
     ) -> AalpResult:
         start = self.clock()
+        if maintenance.is_maintenance_mode(self.root):
+            # Cheapest possible check, ahead of every other stage
+            # (timeouts, provider lookup, lane admission): an operator's
+            # flag file must pre-empt everything, not merely stand in
+            # queue behind an otherwise-normal request path.
+            result = AalpResult(
+                Outcome.MAINTENANCE, message="AALP is in maintenance mode")
+            queue_wait_ms = (self.clock() - start) * 1000
+            return self._audit_and_return(
+                provider_id, flow_id, path, result, start, queue_wait_ms)
+
         # Looked up now purely so a per-provider timeout_overrides entry
         # can apply to the two deadlines below.
         provider = self.providers.get(provider_id)
@@ -315,6 +329,12 @@ class Gateway:
                 "service": "aalp",
                 "interface_version": 1,
                 "capabilities": list(INTERFACE_V1_CAPABILITIES),
+            }).encode("utf-8")
+            return 200, headers, body
+
+        if segments == ["v1", "maintenance"]:
+            body = json.dumps({
+                "maintenance": maintenance.is_maintenance_mode(self.root),
             }).encode("utf-8")
             return 200, headers, body
 
