@@ -10,7 +10,8 @@
     "request.forward",
     "provider.status",
     "provider.concurrency",
-    "request.timeout_outcomes"
+    "request.timeout_outcomes",
+    "service.maintenance"
   ],
 
   "excluded_from_this_interface": {
@@ -99,6 +100,10 @@
       "upstream_error": {
         "meaning": "An upstream network attempt failed at the connection/transport level (DNS, TCP, TLS, or protocol-level failure) before any response was read.",
         "response_status_code": 502
+      },
+      "maintenance": {
+        "meaning": "AALP's own maintenance-mode flag (see service.maintenance) was set at the moment this request was received. No upstream network attempt was made, and no provider- or admission-level check ran first -- maintenance mode pre-empts everything else in request.forward's pipeline.",
+        "response_status_code": 503
       }
     }
   },
@@ -251,7 +256,8 @@
             "properties": {
               "outcome": { "type": "string", "enum": [
                 "unavailable", "queue_timeout", "compression_timeout",
-                "total_timeout", "invalid_response", "upstream_error"
+                "total_timeout", "invalid_response", "upstream_error",
+                "maintenance"
               ]},
               "message": { "type": "string", "description": "Non-normative diagnostic text; clients must key behavior off 'outcome', never off this string." }
             }
@@ -264,8 +270,28 @@
       },
       "possible_outcomes": [
         "success", "unavailable", "queue_timeout", "compression_timeout",
-        "total_timeout", "invalid_response", "upstream_error"
+        "total_timeout", "invalid_response", "upstream_error", "maintenance"
       ]
+    },
+
+    "service.maintenance": {
+      "summary": "Discover whether AALP is currently in maintenance mode, without needing to read its private `.aalp/state/maintenance` flag file directly.",
+      "binding": { "method": "GET", "path": "/_aalp/v1/maintenance" },
+      "request": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "response": {
+        "type": "object",
+        "required": ["maintenance"],
+        "properties": {
+          "maintenance": { "type": "boolean" }
+        }
+      },
+      "outcomes": {
+        "note": "Not modeled with the request.forward Outcome enum. A reachable AALP service always returns 200 with the body above, even while in maintenance mode itself -- discovery is never blocked by maintenance mode."
+      }
     }
   },
 

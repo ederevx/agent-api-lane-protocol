@@ -90,7 +90,8 @@ class CapabilitiesEndpointTest(_TempGatewayCase):
         self.assertEqual(
             payload["capabilities"],
             ["request.forward", "provider.status",
-             "provider.concurrency", "request.timeout_outcomes"])
+             "provider.concurrency", "request.timeout_outcomes",
+             "service.maintenance"])
 
 
 class ProviderStatusListTest(_TempGatewayCase):
@@ -164,6 +165,39 @@ class ProviderStatusSingleTest(_TempGatewayCase):
             "error": "provider_not_found",
             "provider_id": "nonexistent",
         })
+
+
+class MaintenanceEndpointTest(_TempGatewayCase):
+    def test_reports_false_when_flag_absent(self) -> None:
+        _write_provider(self.providers_dir, "ci", concurrency_limit=1)
+        write_credential("ci", "fake-token", root=self.root)
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: FakeConnection())
+        adapter = gateway.as_ingress_handler()
+
+        status, _headers, body = adapter(
+            "GET", "/_aalp/v1/maintenance", {}, b"")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"maintenance": False})
+
+    def test_reports_true_when_flag_present(self) -> None:
+        from aalp import maintenance
+
+        _write_provider(self.providers_dir, "ci", concurrency_limit=1)
+        write_credential("ci", "fake-token", root=self.root)
+        maintenance.enter_maintenance(root=self.root)
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: FakeConnection())
+        adapter = gateway.as_ingress_handler()
+
+        status, _headers, body = adapter(
+            "GET", "/_aalp/v1/maintenance", {}, b"")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"maintenance": True})
 
 
 class OutcomeHeaderTest(_TempGatewayCase):

@@ -43,6 +43,7 @@ CAPABILITIES = [
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
+    "service.maintenance",
 ]
 
 # Mirrors contract.json's outcomes.values.<outcome>.response_status_code.
@@ -53,6 +54,7 @@ OUTCOME_STATUS = {
     "total_timeout": 504,
     "invalid_response": 502,
     "upstream_error": 502,
+    "maintenance": 503,
 }
 
 # Per contract.json's outcome meanings: these three ("An upstream network
@@ -164,8 +166,20 @@ class FakeAalpV1Service:
         self._providers: dict[str, FakeProviderConfig] = {}
         self._lanes: dict[str, _ProviderLane] = {}
         self._programmed: dict[tuple[str, str], deque[ProgrammedResponse]] = {}
+        self._maintenance = False
         if providers:
             self.set_providers(providers)
+
+    # -- service.maintenance -------------------------------------------
+
+    def set_maintenance(self, active: bool) -> None:
+        with self._lock:
+            self._maintenance = active
+
+    @property
+    def is_maintenance(self) -> bool:
+        with self._lock:
+            return self._maintenance
 
     # -- configuration -----------------------------------------------
 
@@ -241,6 +255,8 @@ class FakeAalpV1Service:
         del method, headers, body  # unused by this fake's outcome logic; accepted for shape fidelity
 
         with self._lock:
+            if self._maintenance:
+                return self._maintenance_result()
             provider = self._providers.get(provider_id)
 
         if provider_id.startswith("_") or provider is None or not provider.active:
@@ -283,6 +299,12 @@ class FakeAalpV1Service:
         return ForwardResult("unavailable", OUTCOME_STATUS["unavailable"], headers, body)
 
     @staticmethod
+    def _maintenance_result() -> ForwardResult:
+        body = json.dumps({"outcome": "maintenance", "message": "AALP is in maintenance mode"}).encode()
+        headers = {"X-Aalp-Outcome": "maintenance", "Content-Type": "application/json"}
+        return ForwardResult("maintenance", OUTCOME_STATUS["maintenance"], headers, body)
+
+    @staticmethod
     def _synthetic_outcome(programmed: ProgrammedResponse) -> ForwardResult:
         body = json.dumps({"outcome": programmed.outcome, "message": programmed.message or ""}).encode()
         headers = {"X-Aalp-Outcome": programmed.outcome, "Content-Type": "application/json"}
@@ -314,6 +336,9 @@ def _make_handler(service: FakeAalpV1Service) -> type[BaseHTTPRequestHandler]:
                     return
                 if self.command == "GET" and path == "/_aalp/v1/providers":
                     self._write_json(200, service.list_providers())
+                    return
+                if self.command == "GET" and path == "/_aalp/v1/maintenance":
+                    self._write_json(200, {"maintenance": service.is_maintenance})
                     return
                 if self.command == "GET" and path.startswith("/_aalp/v1/providers/"):
                     provider_id = path[len("/_aalp/v1/providers/") :]
