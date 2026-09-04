@@ -30,6 +30,7 @@ Test setup, in order:
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 import urllib.parse
@@ -44,6 +45,7 @@ CAPABILITIES = [
     "provider.concurrency",
     "request.timeout_outcomes",
     "service.maintenance",
+    "request.queue",
 ]
 
 # Mirrors contract.json's outcomes.values.<outcome>.response_status_code.
@@ -107,6 +109,73 @@ class ForwardResult:
     body: bytes
 
 
+@dataclass
+class QueueForwardResult(ForwardResult):
+    """request.queue's result: identical to ForwardResult plus the two
+    generation-metadata headers contract.json requires on its responses.
+    `generation_id`/`member_count` reflect real coalescing (§6-§13):
+    every logical member that lands in the same generation gets the same
+    `generation_id` and the true `member_count`, matching the real
+    Gateway's `handle_queue()`."""
+
+    generation_id: str = ""
+    member_count: int = 1
+
+
+class QueueEnvelopeError(ValueError):
+    """A member's body didn't carry the envelope shape
+    `_build_physical_body()` needs. Deliberately duplicated (in miniature)
+    from `aalp/queue.py`'s real `QueueEnvelopeError`/`build_physical_body`/
+    `_deep_set` rather than imported -- this fake never imports the `aalp`
+    package (see module docstring)."""
+
+
+def _deep_set(obj: object, path: list, value: object) -> None:
+    if not path:
+        raise QueueEnvelopeError("content_path must not be empty")
+    try:
+        for key in path[:-1]:
+            obj = obj[key]  # type: ignore[index]
+        obj[path[-1]] = value  # type: ignore[index]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise QueueEnvelopeError(f"content_path {path!r} not found in shared envelope") from exc
+
+
+def _build_physical_body(members: list[dict]) -> bytes:
+    """Mechanical (payload-blind) assembly of one physical request body
+    from each member's self-describing envelope -- mirrors
+    `aalp.queue.QueueGeneration.build_physical_body()`: only the leader's
+    (first member's) `shared`/`content_path`/`member_join`/
+    `count_template` are used, but every member contributes its own
+    `member_block`, in append (FIFO) order."""
+    if not members:
+        raise QueueEnvelopeError("generation has no members to assemble")
+    try:
+        leader = members[0]
+        shared = leader["shared"]
+        content_path = leader["content_path"]
+        member_join = leader["member_join"]
+        count_template = leader["count_template"]
+        blocks = [member["member_block"] for member in members]
+    except (KeyError, TypeError) as exc:
+        raise QueueEnvelopeError(f"member payload missing required envelope field {exc!r}") from exc
+    train = member_join.join(blocks) + member_join + count_template.format(member_count=len(members))
+    _deep_set(shared, content_path, train)
+    return json.dumps(shared).encode("utf-8")
+
+
+@dataclass
+class _QueueSlot:
+    """One OPEN-or-later generation's coordination state: the leader (the
+    caller that created this slot) drives it to completion and publishes
+    `result` here exactly once; every joiner blocks on `done_event`."""
+
+    generation_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    members: list[dict] = field(default_factory=list)
+    done_event: threading.Event = field(default_factory=threading.Event)
+    result: QueueForwardResult | None = None
+
+
 class _ProviderLane:
     """Strict submitted-order FIFO admission bounded by concurrency_limit.
 
@@ -161,12 +230,16 @@ class _ProviderLane:
 class FakeAalpV1Service:
     """In-process core: capabilities, provider.status, request.forward."""
 
-    def __init__(self, providers: list[FakeProviderConfig] | None = None) -> None:
+    def __init__(
+        self, providers: list[FakeProviderConfig] | None = None, max_queue_members: int = 4
+    ) -> None:
         self._lock = threading.RLock()
         self._providers: dict[str, FakeProviderConfig] = {}
         self._lanes: dict[str, _ProviderLane] = {}
         self._programmed: dict[tuple[str, str], deque[ProgrammedResponse]] = {}
         self._maintenance = False
+        self.max_queue_members = max_queue_members
+        self._open_queue_slots: dict[tuple[str, str], _QueueSlot] = {}
         if providers:
             self.set_providers(providers)
 
@@ -291,6 +364,152 @@ class FakeAalpV1Service:
             return self._synthetic_outcome(programmed)
         finally:
             lane.release()
+
+    # -- request.queue ----------------------------------------------------
+
+    def submit_queue_member(
+        self,
+        provider_id: str,
+        queue_key: str,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        body: bytes = b"",
+        member_id: str | None = None,
+    ) -> QueueForwardResult:
+        """Real multi-member coalescing (§6-§13), mirroring the real
+        Gateway's leader/joiner split: the first caller to open a
+        generation for `(provider_id, queue_key)` becomes its "leader"
+        and drives it to completion by calling `forward()` directly
+        (which already provides FIFO/concurrency admission via this
+        provider's own `_ProviderLane`); any other caller whose
+        `(provider_id, queue_key)` matches an already-OPEN generation
+        becomes a "joiner", appending its member and blocking on that
+        generation's own completion signal instead. `body` is expected
+        to be the JSON-encoded self-describing envelope
+        `acp/queue_codec.py` builds.
+        """
+        del member_id  # opaque to this fake, same as the real Gateway (§9)
+        try:
+            payload = json.loads(body) if body else {}
+            if not isinstance(payload, dict):
+                raise ValueError("queue member payload must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            result = self._unavailable(f"malformed queue member payload: {exc}")
+            generation_id = secrets.token_hex(8)
+            out_headers = dict(result.headers)
+            out_headers["X-Aalp-Queue-Generation-Id"] = generation_id
+            out_headers["X-Aalp-Queue-Member-Count"] = "0"
+            return QueueForwardResult(
+                outcome=result.outcome, status=result.status, headers=out_headers,
+                body=result.body, generation_id=generation_id, member_count=0)
+
+        slot_key = (provider_id, queue_key)
+        is_leader = False
+        with self._lock:
+            slot = self._open_queue_slots.get(slot_key)
+            if slot is None:
+                slot = _QueueSlot()
+                self._open_queue_slots[slot_key] = slot
+                is_leader = True
+            slot.members.append(payload)
+            if len(slot.members) >= self.max_queue_members:
+                self._open_queue_slots.pop(slot_key, None)
+
+        if is_leader:
+            return self._run_queue_leader(slot, slot_key, provider_id, method, path, headers)
+        return self._wait_queue_joiner(slot)
+
+    def _run_queue_leader(
+        self,
+        slot: _QueueSlot,
+        slot_key: tuple[str, str],
+        provider_id: str,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None,
+    ) -> QueueForwardResult:
+        # Mirrors the real Gateway's leader ordering exactly: acquire this
+        # provider's own admission lane *first* (so a caller stuck behind
+        # an occupied provider stays OPEN for joins the whole time it
+        # waits, and Lane's own FIFO ticket order -- not a separate
+        # scheduler -- is what keeps physical dispatch order correct
+        # across different queue_key generations), and only seal (remove
+        # from `_open_queue_slots`) once actually admitted.
+        del method, headers  # unused by this fake's outcome logic, same as forward()
+        with self._lock:
+            provider = self._providers.get(provider_id)
+
+        if provider_id.startswith("_") or provider is None or not provider.active:
+            with self._lock:
+                self._open_queue_slots.pop(slot_key, None)
+            result: ForwardResult = self._unavailable(
+                f"provider {provider_id!r} unknown or inactive")
+        elif path not in provider.accepted_paths:
+            with self._lock:
+                self._open_queue_slots.pop(slot_key, None)
+            result = self._unavailable(f"path {path!r} not accepted by provider {provider_id!r}")
+        else:
+            lane = self._lanes[provider_id]
+            lane.acquire()
+            try:
+                with self._lock:
+                    self._open_queue_slots.pop(slot_key, None)
+                try:
+                    physical_body = _build_physical_body(slot.members)
+                except QueueEnvelopeError as exc:
+                    result = self._unavailable(str(exc))
+                else:
+                    result = self._pop_and_execute_programmed(provider_id, path, physical_body)
+            finally:
+                lane.release()
+
+        out_headers = dict(result.headers)
+        out_headers["X-Aalp-Queue-Generation-Id"] = slot.generation_id
+        out_headers["X-Aalp-Queue-Member-Count"] = str(len(slot.members))
+        queue_result = QueueForwardResult(
+            outcome=result.outcome, status=result.status, headers=out_headers, body=result.body,
+            generation_id=slot.generation_id, member_count=len(slot.members))
+        slot.result = queue_result
+        slot.done_event.set()
+        return queue_result
+
+    def _wait_queue_joiner(self, slot: _QueueSlot) -> QueueForwardResult:
+        slot.done_event.wait(60)
+        if slot.result is None:
+            # Leader never finished within a generous bound -- surfaced
+            # the same way an unprogrammed forward() call is: a fixture
+            # bug, not a real outcome to synthesize.
+            raise LookupError(
+                f"fake_aalp_v1_service: queue generation {slot.generation_id!r} "
+                "never completed (leader did not signal done_event)")
+        return slot.result
+
+    def _pop_and_execute_programmed(self, provider_id: str, path: str, body: bytes) -> ForwardResult:
+        """Queue-leader-only counterpart to `forward()`'s programmed-
+        response consumption -- called with the provider's lane already
+        held, so (unlike `forward()`) every outcome is treated uniformly
+        rather than skipping the lane for non-network-attempt outcomes;
+        no current queue test relies on that distinction."""
+        del body  # this fake's canned responses never depend on the physical body's content
+        key = (provider_id, path)
+        with self._lock:
+            queue = self._programmed.get(key)
+            if not queue:
+                raise LookupError(
+                    f"fake_aalp_v1_service: no response programmed for provider={provider_id!r} "
+                    f"path={path!r}; call program_response(...) before exercising request.queue "
+                    "for this (provider_id, path)"
+                )
+            programmed = queue.popleft()
+
+        if programmed.delay:
+            time.sleep(programmed.delay)
+        if programmed.outcome == "success":
+            out_headers = dict(programmed.headers)
+            out_headers["X-Aalp-Outcome"] = "success"
+            return ForwardResult("success", programmed.status, out_headers, programmed.body)
+        return self._synthetic_outcome(programmed)
 
     @staticmethod
     def _unavailable(message: str) -> ForwardResult:

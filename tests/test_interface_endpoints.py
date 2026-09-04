@@ -91,7 +91,7 @@ class CapabilitiesEndpointTest(_TempGatewayCase):
             payload["capabilities"],
             ["request.forward", "provider.status",
              "provider.concurrency", "request.timeout_outcomes",
-             "service.maintenance"])
+             "service.maintenance", "request.queue"])
 
 
 class ProviderStatusListTest(_TempGatewayCase):
