@@ -353,9 +353,7 @@ class FileLaneStatusTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             lane = FileLane("ci", 3, directory=Path(tmp))
             status = lane.status()
-            self.assertEqual(status["capacity"], 3)
-            self.assertEqual(status["in_flight"], 0)
-            self.assertTrue(status["idle"])
+            self.assertEqual(status, {"in_flight": 0, "idle": True})
 
     def test_partial_occupancy_reports_correct_in_flight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -433,7 +431,7 @@ class FileLaneStatusTest(unittest.TestCase):
             self.assertFalse(holder.is_alive())
             self.assertEqual(counter.value, iterations)
 
-    def test_in_flight_drops_after_sigkill_and_idle_seconds_is_sane(self) -> None:
+    def test_in_flight_drops_after_sigkill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             lane = FileLane("ci", 1, directory=Path(tmp))
             acquired_event = _CTX.Event()
@@ -454,37 +452,6 @@ class FileLaneStatusTest(unittest.TestCase):
             status = self._poll_until(
                 lambda: (lambda s: s if s["in_flight"] == 0 else None)(lane.status()))
             self.assertTrue(status["idle"])
-            # Per FileLane.status()'s documented limitation, idle_seconds
-            # after a crashed (SIGKILLed, not cleanly released) holder
-            # can overstate true idle time by roughly that hold's own
-            # duration, because nothing observes the actual moment of
-            # death -- this is a known, accepted approximation, not a
-            # bug. So only assert this is a sane, non-negative float,
-            # never a tight bound on its exact value.
-            idle_seconds = status["idle_seconds"]
-            self.assertIsInstance(idle_seconds, float)
-            self.assertGreaterEqual(idle_seconds, 0.0)
-
-    def test_idle_seconds_behaves_sanely_on_clean_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            lane = FileLane("ci", 1, directory=Path(tmp))
-            status = lane.status()
-            self.assertLess(status["idle_seconds"], 2.0)
-            self.assertTrue(lane.activity_path.exists())
-
-            lease = lane.acquire(timeout_seconds=1)
-            lease.release()
-            status = lane.status()
-            # Reset by the release-time touch -- still small.
-            self.assertLess(status["idle_seconds"], 2.0)
-
-            time.sleep(0.3)
-            status_after = lane.status()
-            # Generous, non-flaky bounds around the ~0.3s that elapsed,
-            # matching the tolerance style used by
-            # test_acquire_times_out_cleanly_without_hanging above.
-            self.assertGreaterEqual(status_after["idle_seconds"], 0.2)
-            self.assertLess(status_after["idle_seconds"], 2.0)
 
 
 if __name__ == "__main__":

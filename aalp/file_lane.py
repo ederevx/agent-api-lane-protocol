@@ -132,22 +132,34 @@ Called out explicitly, per design review, rather than smoothed over:
   file-lock admission is ever extended to flow admission (the other
   caller of `Lane`, per `lane.py`'s own docstring), that reentrancy
   need has to be designed for separately -- it is out of scope here.
-* **`queued`, specifically, out of `status()`.** `Lane.status()`
-  reports `leased`, `queued`, `idle`, and `idle_seconds` from its own
-  in-process state. `FileLane.status()` (below) reports the analogues
-  of the first three under the names `in_flight`, `idle`, and
-  `idle_seconds`, plus `capacity` -- but never `queued`: nothing
-  registers a waiter anywhere here (that's what makes this lock-free
-  of a shared waiter list, and therefore not FIFO), and there is no
-  honest way to produce that count. `in_flight` is filled in by
-  probing every slot's lock via `filelock_compat.probe()`, which is
-  specifically designed (see that module) to do this without
-  perturbing a real holder or a free slot -- unlike a "leased" count,
-  a momentary shared-lock check does not have the disturbance problem
-  called out in earlier revisions of this paragraph. `idle_seconds`
-  has no in-process timestamp to read either; see `FileLane.status()`
-  for how it is approximated from a small on-disk marker instead, and
-  what that approximation cannot promise across a crashed holder.
+* **`queued` and `idle_seconds`, specifically, out of `status()`.**
+  `Lane.status()` reports `capacity`, `leased`, `queued`, `idle`, and
+  `idle_seconds` from its own in-process state. `FileLane.status()`
+  (below) reports only `in_flight` (the analogue of `leased`, filled
+  in by probing every slot's lock via `filelock_compat.probe()`,
+  which is specifically designed -- see that module -- to do this
+  without perturbing a real holder or a free slot) and `idle`
+  (`in_flight == 0`).
+
+  Both `queued` and `idle_seconds` are left out for the same reason:
+  nothing here can produce an honest value for either. `queued` has
+  no waiter registry to read (that's what makes this lock-free of a
+  shared list, and therefore not FIFO, per above). `idle_seconds`
+  looks more available than it is -- a first attempt kept a small
+  on-disk "last activity" marker, touched on acquire and release, and
+  derived `idle_seconds` from its mtime. That marker cannot be
+  trusted: the entire reason this module uses OS locks instead of
+  `Lane`'s in-process bookkeeping is that a `SIGKILL`ed holder runs no
+  cleanup code at all, and a marker write on release is exactly
+  cleanup code -- it never runs for a crashed holder. Once that
+  holder's slot is later found free by the OS reclaiming its lock,
+  the marker still shows the time of its *acquire*, so any
+  `idle_seconds` read from it overstates true idle time in exactly
+  the direction that makes a caller wrongly conclude something has
+  been safely dormant longer than it has. That is worse than reporting
+  nothing, so this module reports nothing: no marker file, no writes
+  to any lock file, no `idle_seconds` key at all. `status()` is
+  strictly read-only -- it observes lock state and nothing else.
 """
 from __future__ import annotations
 
@@ -191,17 +203,6 @@ def lock_path(directory: str | Path, provider_id: str, slot: int) -> Path:
     return Path(directory) / f"lane.{provider_id}.{slot}.lock"
 
 
-def activity_path(directory: str | Path, provider_id: str) -> Path:
-    """One small marker file per provider, touched (mtime bumped, no
-    content that matters) on every successful acquire and every
-    release. Not a lock -- never opened with any `fcntl`/`msvcrt` call
-    -- purely a persisted "something happened at this wall-clock time"
-    stamp that survives process death, used by `FileLane.status()` to
-    approximate `idle_seconds`. See that method's docstring for what
-    this can and cannot promise."""
-    return Path(directory) / f"lane.{provider_id}.activity"
-
-
 @dataclass
 class FileLease:
     """A held admission slot for one provider.
@@ -219,22 +220,10 @@ class FileLease:
     slot: int
     path: Path
     _lock: FileLock
-    _activity_path: Path | None = None
 
     def release(self) -> None:
         if self._lock.is_locked:
             self._lock.release()
-            if self._activity_path is not None:
-                # Best-effort activity stamp for FileLane.status()'s
-                # idle_seconds; see that method's docstring. Touching
-                # this is not part of the release's correctness (a
-                # missing or stale stamp never affects mutual
-                # exclusion), so a failure here must never mask the
-                # release that already happened above.
-                try:
-                    self._activity_path.touch()
-                except OSError:
-                    pass
 
     def __enter__(self) -> "FileLease":
         return self
@@ -280,23 +269,12 @@ class FileLane:
         self._lock_paths = [
             lock_path(self.directory, provider_id, slot) for slot in range(capacity)
         ]
-        self.activity_path = activity_path(self.directory, provider_id)
 
     def _ensure_directory(self) -> None:
         # exist_ok=True (rather than a bare mkdir + FileExistsError
         # catch) is the same guarantee either way: both racing
         # first-run processes converge without either erroring.
         self.directory.mkdir(parents=True, exist_ok=True)
-
-    def _touch_activity(self) -> None:
-        # Shared by a successful acquire and a release -- see
-        # `status()` for why both ends of a hold, not just release,
-        # bump this stamp. Best-effort: never let a failure here mask
-        # the acquire/release that already succeeded.
-        try:
-            self.activity_path.touch()
-        except OSError:
-            pass
 
     def _try_slots_once(self) -> FileLease | None:
         start = self._rng.randrange(self.capacity)
@@ -307,10 +285,7 @@ class FileLane:
                 candidate.acquire()
             except LockBusy:
                 continue
-            self._touch_activity()
-            return FileLease(
-                self.provider_id, slot, self._lock_paths[slot], candidate,
-                self.activity_path)
+            return FileLease(self.provider_id, slot, self._lock_paths[slot], candidate)
         return None
 
     def acquire(self, timeout_seconds: float) -> FileLease:
@@ -339,11 +314,11 @@ class FileLane:
             time.sleep(min(remaining, sleep_for))
 
     def status(self) -> dict[str, Any]:
-        """Best-effort introspection, filling in every field
-        `Lane.status()` reports except `queued` -- see this module's
-        docstring ("Not preserved from `Lane`") for why no honest
-        `queued` count exists in a daemonless, waiter-registry-free
-        design. Returns `capacity`, `in_flight`, `idle`, `idle_seconds`.
+        """Best-effort, strictly read-only introspection. Returns
+        exactly `in_flight` and `idle` -- see this module's docstring
+        ("Not preserved from `Lane`") for why `Lane.status()`'s other
+        fields, `queued` and `idle_seconds`, have no honest equivalent
+        here and are deliberately omitted rather than faked.
 
         `in_flight` is a fresh probe, not cached state: it calls
         `filelock_compat.probe()` once per slot, right now, in this
@@ -354,46 +329,20 @@ class FileLane:
         does not disturb them and does not perturb a free slot either.
         `idle` is simply `in_flight == 0` from that same probe pass.
 
-        `idle_seconds` cannot be read from any in-process timestamp --
-        there is no resident process here to hold one, by design (see
-        this module's docstring). Instead it is read from
-        `self.activity_path`'s mtime: a small marker file this lane
-        touches on every successful `acquire()` and every `release()`
-        (both ends of a hold, mirroring `Lane.status()`'s own
-        `last_activity`, which likewise updates on any transition --
-        acquire, release, or heartbeat -- not only on "went idle"
-        events). A file's mtime is OS-maintained metadata, so this
-        survives process death without any code needing to run at
-        exit, and every read/write of it happens against this one
-        machine's own clock -- there is no attempt, and no need, to
-        compare timestamps written by different machines.
-
-        Known limitation, stated plainly rather than hidden: a holder
-        that crashes without releasing leaves the marker at the time
-        of its own acquire. Once that slot is later found free (by an
-        OS-level reclaim this module did not initiate), the next
-        `status()` call's idle_seconds will overstate true idle time
-        by roughly that crashed hold's own duration, because nothing
-        observed the actual moment of death. That overstatement is
-        bounded by a single hold's length and is not cumulative -- the
-        very next acquire or release recorded anywhere in this lane
-        resets the stamp to a real event again. If the marker has
-        never been touched at all (this lane has never completed a
-        single acquire or release since `.aalp/state/` was created),
-        this call creates it now and reports 0.0, the same way
-        `Lane.__init__` sets `last_activity = clock()` at construction
-        and likewise cannot know how long a never-used lane was idle
-        before it existed.
+        This method never writes anything -- not to a lock file, not
+        to any sidecar/marker file. There used to be an on-disk
+        activity marker backing an `idle_seconds` field; it was
+        removed (see the docstring section referenced above) because
+        it could not be trusted across a crashed holder, and dropping
+        it entirely -- rather than keeping the write machinery around
+        unused -- means `status()` needs no write permission on
+        `.aalp/state/` and can never itself race with a real acquirer
+        over any file's contents.
         """
         self._ensure_directory()
         in_flight = sum(1 for path in self._lock_paths if probe(path))
         idle = in_flight == 0
-        if not self.activity_path.exists():
-            self._touch_activity()
-        idle_seconds = max(0.0, time.time() - self.activity_path.stat().st_mtime)
         return {
-            "capacity": self.capacity,
             "in_flight": in_flight,
             "idle": idle,
-            "idle_seconds": idle_seconds,
         }
