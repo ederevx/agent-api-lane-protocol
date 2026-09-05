@@ -22,18 +22,21 @@ Mechanism
 A provider with `concurrency_limit` N owns N lock files,
 ``lane.<provider_id>.<slot>.lock`` for ``slot`` in ``0..N-1``, under
 ``.aalp/state/``. Acquiring a slot means holding a non-blocking OS
-advisory lock (via the ``filelock`` package -- ``fcntl.flock`` on
-Linux, `LockFileEx` on Windows) on one of those N files; N simultaneous
-holders is exactly N processes each holding a distinct file's lock.
-`concurrency_limit` -- and therefore N -- is config, so raising it is a
-config change here too, never a code change: the acquire loop is
-already written to walk however many slots exist.
+lock (via this repo's own `aalp.filelock_compat` -- `fcntl.flock` on
+POSIX, `msvcrt.locking` on Windows; see that module for why this is a
+~40-line in-repo shim rather than the third-party `filelock` package)
+on one of those N files; N simultaneous holders is exactly N processes
+each holding a distinct file's lock. `concurrency_limit` -- and
+therefore N -- is config, so raising it is a config change here too,
+never a code change: the acquire loop is already written to walk
+however many slots exist.
 
 To avoid every waiter racing to try slot 0 first, each attempt round
 starts at a random slot index and wraps around. Free slots are found
-with a single non-blocking probe per slot (`FileLock.acquire(blocking=
-False)`); if every slot is taken, the caller sleeps a jittered interval
-and tries again, bounded by an overall deadline -- see "Timeout
+with a single non-blocking probe per slot (`FileLock.acquire()`, which
+never blocks and raises `LockBusy` immediately if that slot is taken);
+if every slot is taken, the caller sleeps a jittered interval and
+tries again, bounded by an overall deadline -- see "Timeout
 discipline" below.
 
 What this trades away
@@ -73,6 +76,14 @@ unbounded hang. We gain instant, code-free crash recovery; we lose
 TTL-based self-healing of a live-but-wedged holder. That is a
 deliberate trade, not an oversight.
 
+Windows note: the byte-range-lock behavior `msvcrt.locking` requires
+(seek to a fixed offset, lock a fixed byte count, consistently across
+acquire/release/retry) is handled entirely inside `filelock_compat.py`
+and is UNVERIFIED -- no Windows machine was available to run it in the
+session that wrote it. Everything in *this* module is platform-neutral
+on top of that shim's interface, so it needs no separate Windows
+caveat beyond deferring to that module's.
+
 Two more properties worth calling out because they are easy to get
 wrong with file locks specifically:
 
@@ -99,8 +110,8 @@ already exist, so both racing processes converge without either
 raising. The lock files themselves are never created with
 `O_CREAT | O_EXCL`: a lock file's mere existence carries no meaning,
 only its lock state does, so there is nothing to race over there
-either (`filelock` opens each one with plain `O_CREAT`, tolerating --
-indeed expecting -- the file to already exist).
+either (`filelock_compat.FileLock` opens each one with plain `O_CREAT`,
+tolerating -- indeed expecting -- the file to already exist).
 
 Not preserved from `Lane`
 --------------------------
@@ -139,8 +150,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from filelock import FileLock
-from filelock import Timeout as _OSLockTimeout
+from .filelock_compat import FileLock, LockBusy
 
 DEFAULT_POLL_INTERVAL_SECONDS = 0.05
 DEFAULT_JITTER_SECONDS = 0.05
@@ -250,10 +260,10 @@ class FileLane:
         start = self._rng.randrange(self.capacity)
         for offset in range(self.capacity):
             slot = (start + offset) % self.capacity
-            candidate = FileLock(str(self._lock_paths[slot]))
+            candidate = FileLock(self._lock_paths[slot])
             try:
-                candidate.acquire(blocking=False)
-            except _OSLockTimeout:
+                candidate.acquire()
+            except LockBusy:
                 continue
             return FileLease(self.provider_id, slot, self._lock_paths[slot], candidate)
         return None
