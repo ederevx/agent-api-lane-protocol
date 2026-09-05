@@ -259,6 +259,75 @@ class QuarantineTest(_TempGatewayCase):
         self.assertTrue(result2.ok)
 
 
+class LateConfirmedCloseTest(_TempGatewayCase):
+    def test_late_confirmed_close_releases_the_lane_before_ttl_reclaims_it(
+        self,
+    ) -> None:
+        _write_provider(
+            self.providers_dir, "prov", concurrency_limit=1,
+            timeout_overrides={"compression_timeout_seconds": 0.1})
+        write_credential("prov", "fake-token", root=self.root)
+
+        block_event = threading.Event()
+        fake_conn = FakeConnection(
+            response=FakeResponse(status=200, body=b"ok"),
+            block_event=block_event)
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: fake_conn,
+            # Deliberately long -- if the lane clears at all before the
+            # test manually advances anything, it can only be because
+            # on_late_completion released it, not the TTL.
+            lease_seconds=30.0)
+
+        result = gateway.handle(
+            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+
+        self.assertEqual(result.outcome, Outcome.COMPRESSION_TIMEOUT)
+        self.assertEqual(
+            gateway.provider_lanes["prov"].status()["leased"], 1)
+
+        # Let the abandoned background thread's getresponse() return and
+        # close() succeed -- a confirmed close arriving well after
+        # handle() already gave up and returned COMPRESSION_TIMEOUT.
+        block_event.set()
+        _wait_until(
+            lambda: gateway.provider_lanes["prov"].status()["leased"] == 0)
+
+
+class LateUnconfirmedCloseTest(_TempGatewayCase):
+    def test_late_unconfirmed_close_still_does_not_force_release(self) -> None:
+        _write_provider(
+            self.providers_dir, "prov", concurrency_limit=1,
+            timeout_overrides={"compression_timeout_seconds": 0.1})
+        write_credential("prov", "fake-token", root=self.root)
+
+        block_event = threading.Event()
+        fake_conn = FakeConnection(
+            response=FakeResponse(status=200, body=b"ok"),
+            block_event=block_event,
+            close_exception=RuntimeError("socket already gone"))
+        gateway = Gateway(
+            self.providers_dir, root=self.root,
+            connection_factory=lambda provider, timeout: fake_conn,
+            lease_seconds=30.0)
+
+        result = gateway.handle(
+            "flow-A", "prov", "POST", "/v1/messages", {}, b"{}")
+
+        self.assertEqual(result.outcome, Outcome.COMPRESSION_TIMEOUT)
+        self.assertEqual(
+            gateway.provider_lanes["prov"].status()["leased"], 1)
+
+        # Let the abandoned background thread run its own (failing)
+        # close() and invoke on_late_completion -- safety property: an
+        # unconfirmed close must never force a release, late or not.
+        block_event.set()
+        time.sleep(0.3)
+        self.assertEqual(
+            gateway.provider_lanes["prov"].status()["leased"], 1)
+
+
 class ConfirmedCloseTest(_TempGatewayCase):
     def test_confirmed_close_releases_the_lane_slot_immediately(self) -> None:
         _write_provider(self.providers_dir, "prov", concurrency_limit=1)

@@ -255,11 +255,30 @@ class Gateway:
             compression_timeout = _resolve_timeout(
                 provider, "compression_timeout_seconds",
                 "ACP_COMPRESSION_TIMEOUT", 60)
+
+            def _on_late_completion(
+                late_result: AalpResult, late_closed: bool,
+            ) -> None:
+                # Fires from forward()'s own abandoned background thread,
+                # at an arbitrary later time -- possibly well after this
+                # handle() call has already returned. Only ever releases
+                # on a *confirmed* close, preserving §19 quarantine's
+                # safety property exactly; the only thing this changes is
+                # that a confirmed-stopped call no longer has to wait out
+                # the full `lease_seconds` TTL to give its slot back.
+                # `lane.release()` is Condition-guarded and idempotent on
+                # a stale/already-reclaimed token, so calling it late and
+                # from an arbitrary thread is safe even if the TTL already
+                # reclaimed this same lease in the meantime.
+                if late_closed:
+                    lane.release(flow_id, provider_token)
+
             try:
                 result, closed = forwarder.forward(
                     provider, credential, method, path, headers, body,
                     timeout_seconds=compression_timeout,
                     connection_factory=self.connection_factory,
+                    on_late_completion=_on_late_completion,
                 )
             except ValueError as error:
                 # Bad `path` — a config/caller bug, never a real
@@ -272,11 +291,12 @@ class Gateway:
 
         if closed:
             lane.release(flow_id, provider_token)
-        # else: leave the lease in place. This *is* §19 quarantine — an
-        # unconfirmed close means we cannot prove the upstream operation
-        # actually stopped, so the slot is left held until its own TTL
-        # (lease_seconds) reclaims it, rather than building a second
-        # mechanism for the same guarantee Lane already provides.
+        # else: leave the lease in place for now. This *is* §19
+        # quarantine — an unconfirmed close means we cannot prove the
+        # upstream operation actually stopped, so the slot stays held
+        # until either `_on_late_completion` above confirms the real
+        # outcome, or (failing that) its own TTL (lease_seconds)
+        # reclaims it -- whichever happens first.
 
         return self._audit_and_return(
             provider_id, flow_id, path, result, start, queue_wait_ms)
