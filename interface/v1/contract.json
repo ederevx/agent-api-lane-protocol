@@ -11,7 +11,8 @@
     "provider.status",
     "provider.concurrency",
     "request.timeout_outcomes",
-    "service.maintenance"
+    "service.maintenance",
+    "request.queue"
   ],
 
   "excluded_from_this_interface": {
@@ -292,6 +293,69 @@
       "outcomes": {
         "note": "Not modeled with the request.forward Outcome enum. A reachable AALP service always returns 200 with the body above, even while in maintenance mode itself -- discovery is never blocked by maintenance mode."
       }
+    },
+
+    "request.queue": {
+      "summary": "Submit one queue member for contention-driven coalescing (agent_protocols_v1_queue_coalescing_adjustment_metadata_v1.md §6-§13). Real leader/joiner coalescing, not a Stage-1 singleton passthrough: the first caller for a given (provider_id, X-Aalp-Queue-Key) becomes that generation's leader and makes the one physical provider call; any other caller whose key matches an already-OPEN generation becomes a joiner, is mechanically appended to the same physical request/response, and never itself contacts the provider. A generation seals (stops accepting new joiners) once its members' combined input size reaches max_queue_input_bytes or the provider becomes free to serve it, whichever comes first. A caller that never sends X-Aalp-Queue-Key is completely unaffected and continues to get request.forward's behavior verbatim. Honors service.maintenance identically to request.forward.",
+      "binding": {
+        "method": "any (forwarded verbatim to the provider, identical to request.forward)",
+        "path": "/{provider_id}/{upstream_path}",
+        "path_notes": "Identical to request.forward.",
+        "trigger": "Presence of the X-Aalp-Queue-Key request header on an otherwise request.forward-shaped call selects this operation instead of request.forward; its absence always selects request.forward."
+      },
+      "request": {
+        "type": "object",
+        "properties": {
+          "provider_id": { "type": "string", "description": "Taken from the path, not a header or body field." },
+          "method": { "type": "string" },
+          "path": { "type": "string", "description": "Must be one of the target provider's accepted_paths." },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "properties": {
+              "X-Aalp-Flow-Id": {
+                "type": "string",
+                "description": "Optional. See scheduling_model.flow_id. Never required, never a scheduling reservation."
+              },
+              "X-Aalp-Queue-Key": {
+                "type": "string",
+                "description": "Required to select request.queue. Opaque to AALP (§9) -- compared for equality only, never parsed. Two requests are coalescing-compatible only if this value is identical."
+              },
+              "X-Aalp-Queue-Member-Id": {
+                "type": "string",
+                "description": "Optional. Opaque member identifier; synthesized by AALP if omitted. Used only for generation bookkeeping and audit correlation -- AALP never parses or interprets it (§9)."
+              }
+            },
+            "description": "Forwarded upstream verbatim (minus the X-Aalp-Queue-* headers themselves), except the provider's own declared auth header, which AALP overwrites with the credential it holds."
+          },
+          "body": {
+            "type": "string",
+            "format": "binary",
+            "description": "The self-describing envelope defined by the calling protocol (e.g. ACP's queue_codec module) -- AALP never interprets its contents beyond mechanically joining each member's own block into the shared physical request body per the envelope's own join rules (§9, §11). A solo (unjoined) member's body is forwarded upstream unmodified, identical to request.forward."
+          }
+        },
+        "required": ["provider_id", "method", "path", "X-Aalp-Queue-Key"]
+      },
+      "response": {
+        "on_outcome_success": {
+          "status_code": "passthrough (see outcomes.values.success)",
+          "headers": "passthrough (upstream response headers, verbatim) plus X-Aalp-Outcome: success, X-Aalp-Queue-Generation-Id, X-Aalp-Queue-Member-Count",
+          "body": "passthrough (upstream response body, verbatim)"
+        },
+        "on_other_outcome": {
+          "status_code": "per outcomes.values.<outcome>.response_status_code",
+          "headers": { "X-Aalp-Outcome": "the outcome value", "X-Aalp-Queue-Generation-Id": "the sealed generation id", "X-Aalp-Queue-Member-Count": "the sealed generation's member count" },
+          "body": "identical shape to request.forward's on_other_outcome body"
+        },
+        "x_aalp_queue_generation_id_header": {
+          "requirement_level": "REQUIRED in interface v1 for request.queue responses",
+          "rationale": "Lets a client correlate its own request with the generation AALP actually sealed it into, whether that generation ended up with one member or several."
+        }
+      },
+      "possible_outcomes": [
+        "success", "unavailable", "queue_timeout", "compression_timeout",
+        "total_timeout", "invalid_response", "upstream_error", "maintenance"
+      ]
     }
   },
 

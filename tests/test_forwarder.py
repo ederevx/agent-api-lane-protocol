@@ -290,6 +290,53 @@ class DeadlineWatchdogTest(unittest.TestCase):
         self.assertLess(elapsed, 2.0)
 
 
+class OnLateCompletionTest(unittest.TestCase):
+    def test_fires_with_real_outcome_after_caller_already_gave_up(self):
+        provider = make_provider()
+        release = threading.Event()
+        fake = SlowFakeConnection(release)
+        late_calls: list[tuple] = []
+        late_call_seen = threading.Event()
+
+        def on_late_completion(result, closed):
+            late_calls.append((result, closed))
+            late_call_seen.set()
+
+        result, closed = forward(
+            provider, "tok", "POST", "/v1/messages", {}, b"{}",
+            timeout_seconds=0.2,
+            connection_factory=lambda p, t: fake,
+            on_late_completion=on_late_completion,
+        )
+        self.assertEqual(result.outcome, Outcome.COMPRESSION_TIMEOUT)
+        self.assertFalse(closed)
+        self.assertEqual(late_calls, [])
+
+        # Let the abandoned background thread's read() finish now.
+        release.set()
+        self.assertTrue(late_call_seen.wait(timeout=5.0))
+
+        self.assertEqual(len(late_calls), 1)
+        late_result, late_closed = late_calls[0]
+        self.assertEqual(late_result.outcome, Outcome.SUCCESS)
+        self.assertTrue(late_closed)
+
+    def test_not_called_when_caller_never_gives_up(self):
+        provider = make_provider()
+        fake = FakeConnection(response=FakeResponse(status=200, body=b"ok"))
+        late_calls: list[tuple] = []
+
+        result, closed = forward(
+            provider, "tok", "POST", "/v1/messages", {}, b"{}", 10.0,
+            connection_factory=lambda p, t: fake,
+            on_late_completion=lambda r, c: late_calls.append((r, c)),
+        )
+
+        self.assertEqual(result.outcome, Outcome.SUCCESS)
+        self.assertTrue(closed)
+        self.assertEqual(late_calls, [])
+
+
 class BuildConnectionTest(unittest.TestCase):
     def test_unknown_client_raises_value_error(self):
         provider = make_provider(client="some-other-client")

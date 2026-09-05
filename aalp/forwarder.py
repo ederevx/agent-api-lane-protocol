@@ -65,6 +65,7 @@ def forward(
     body: bytes,
     timeout_seconds: float,
     connection_factory: ConnectionFactory | None = None,
+    on_late_completion: Callable[[AalpResult, bool], None] | None = None,
 ) -> tuple[AalpResult, bool]:
     """Send one request upstream and classify the transport outcome.
 
@@ -87,8 +88,12 @@ def forward(
     returns Outcome.COMPRESSION_TIMEOUT with `closed=False`: the same
     unconfirmed-close quarantine path already used when close() itself
     fails (see Gateway.handle()'s handling of that flag). The abandoned
-    thread is left to finish or fail on its own; its result, and the
-    connection it holds, are simply never looked at again.
+    thread is left to finish or fail on its own -- but if `on_late_completion`
+    is given, it is called exactly once, from that background thread, with
+    the real `(result, closed)` it eventually produces, so a caller that
+    quarantined a concurrency slot on the assumption of "unconfirmed" can
+    still learn the true outcome once it exists rather than only ever
+    trusting a fixed timer to reclaim that slot.
     """
     allowed_paths = provider.request_shape.get("paths", [])
     if path not in allowed_paths:
@@ -109,9 +114,12 @@ def forward(
     factory = connection_factory or build_connection
     connection = factory(provider, timeout_seconds)
 
+    outcome_lock = threading.Lock()
     outcome_box: list[tuple[AalpResult, bool]] = []
+    caller_gave_up = False
 
     def _do_call() -> None:
+        nonlocal caller_gave_up
         try:
             try:
                 connection.request(
@@ -145,22 +153,36 @@ def forward(
                 closed = True
             except Exception:
                 closed = False
-            outcome_box.append((result, closed))
+            notify_late = False
+            with outcome_lock:
+                outcome_box.append((result, closed))
+                if caller_gave_up:
+                    notify_late = True
+            if notify_late and on_late_completion is not None:
+                on_late_completion(result, closed)
 
     worker = threading.Thread(target=_do_call, daemon=True)
     worker.start()
     worker.join(timeout_seconds)
 
-    if not outcome_box:
-        return (
-            AalpResult(
-                outcome=Outcome.COMPRESSION_TIMEOUT,
-                message=f"no response within {timeout_seconds}s",
-            ),
-            False,
-        )
+    # Holding `outcome_lock` across this check-and-decide is what makes it
+    # safe: it forces a strict order against `_do_call`'s own critical
+    # section above, so either this sees the finished result and returns it
+    # directly, or `_do_call` is guaranteed to see `caller_gave_up` already
+    # True and fire `on_late_completion` itself -- there is no interleaving
+    # where the late result is simply dropped on the floor.
+    with outcome_lock:
+        if outcome_box:
+            return outcome_box[0]
+        caller_gave_up = True
 
-    return outcome_box[0]
+    return (
+        AalpResult(
+            outcome=Outcome.COMPRESSION_TIMEOUT,
+            message=f"no response within {timeout_seconds}s",
+        ),
+        False,
+    )
 
 
 def probe(
