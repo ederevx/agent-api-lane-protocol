@@ -132,15 +132,34 @@ Called out explicitly, per design review, rather than smoothed over:
   file-lock admission is ever extended to flow admission (the other
   caller of `Lane`, per `lane.py`'s own docstring), that reentrancy
   need has to be designed for separately -- it is out of scope here.
-* **`status()` introspection.** `Lane.status()` reports `leased`,
-  `queued`, `idle`, and `idle_seconds` from its own in-process state.
-  There is no equivalent source of truth here: nothing registers a
-  waiter anywhere (that's what makes this lock-free of a shared waiter
-  list, and therefore not FIFO), and even a "leased" count could only
-  be produced by probing every slot's lock, which would itself
-  perturb -- however briefly -- any slot found free. This module
-  exposes no `status()`; a caller that needs observability here would
-  need a new, deliberately-designed mechanism, not a port of this one.
+* **`queued` and `idle_seconds`, specifically, out of `status()`.**
+  `Lane.status()` reports `capacity`, `leased`, `queued`, `idle`, and
+  `idle_seconds` from its own in-process state. `FileLane.status()`
+  (below) reports only `in_flight` (the analogue of `leased`, filled
+  in by probing every slot's lock via `filelock_compat.probe()`,
+  which is specifically designed -- see that module -- to do this
+  without perturbing a real holder or a free slot) and `idle`
+  (`in_flight == 0`).
+
+  Both `queued` and `idle_seconds` are left out for the same reason:
+  nothing here can produce an honest value for either. `queued` has
+  no waiter registry to read (that's what makes this lock-free of a
+  shared list, and therefore not FIFO, per above). `idle_seconds`
+  looks more available than it is -- a first attempt kept a small
+  on-disk "last activity" marker, touched on acquire and release, and
+  derived `idle_seconds` from its mtime. That marker cannot be
+  trusted: the entire reason this module uses OS locks instead of
+  `Lane`'s in-process bookkeeping is that a `SIGKILL`ed holder runs no
+  cleanup code at all, and a marker write on release is exactly
+  cleanup code -- it never runs for a crashed holder. Once that
+  holder's slot is later found free by the OS reclaiming its lock,
+  the marker still shows the time of its *acquire*, so any
+  `idle_seconds` read from it overstates true idle time in exactly
+  the direction that makes a caller wrongly conclude something has
+  been safely dormant longer than it has. That is worse than reporting
+  nothing, so this module reports nothing: no marker file, no writes
+  to any lock file, no `idle_seconds` key at all. `status()` is
+  strictly read-only -- it observes lock state and nothing else.
 """
 from __future__ import annotations
 
@@ -149,8 +168,9 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from .filelock_compat import FileLock, LockBusy
+from .filelock_compat import FileLock, LockBusy, probe
 
 DEFAULT_POLL_INTERVAL_SECONDS = 0.05
 DEFAULT_JITTER_SECONDS = 0.05
@@ -292,3 +312,37 @@ class FileLane:
                     f"file lane acquire timed out for provider {self.provider_id!r}")
             sleep_for = self.poll_interval_seconds + self._rng.uniform(0, self.jitter_seconds)
             time.sleep(min(remaining, sleep_for))
+
+    def status(self) -> dict[str, Any]:
+        """Best-effort, strictly read-only introspection. Returns
+        exactly `in_flight` and `idle` -- see this module's docstring
+        ("Not preserved from `Lane`") for why `Lane.status()`'s other
+        fields, `queued` and `idle_seconds`, have no honest equivalent
+        here and are deliberately omitted rather than faked.
+
+        `in_flight` is a fresh probe, not cached state: it calls
+        `filelock_compat.probe()` once per slot, right now, in this
+        call. Each probe is a momentary shared-lock check (a brief
+        exclusive try-then-release on Windows -- see that function's
+        docstring) that never blocks and never itself counts as a
+        holder, so calling `status()` while real holders are working
+        does not disturb them and does not perturb a free slot either.
+        `idle` is simply `in_flight == 0` from that same probe pass.
+
+        This method never writes anything -- not to a lock file, not
+        to any sidecar/marker file. There used to be an on-disk
+        activity marker backing an `idle_seconds` field; it was
+        removed (see the docstring section referenced above) because
+        it could not be trusted across a crashed holder, and dropping
+        it entirely -- rather than keeping the write machinery around
+        unused -- means `status()` needs no write permission on
+        `.aalp/state/` and can never itself race with a real acquirer
+        over any file's contents.
+        """
+        self._ensure_directory()
+        in_flight = sum(1 for path in self._lock_paths if probe(path))
+        idle = in_flight == 0
+        return {
+            "in_flight": in_flight,
+            "idle": idle,
+        }

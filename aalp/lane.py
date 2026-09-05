@@ -3,17 +3,21 @@
 A condition-variable-based admission primitive: any number of holders
 may queue for a bounded number of simultaneous leases, admission is
 strictly FIFO, and an abandoned lease is reclaimed automatically once
-its time-to-live lapses rather than needing an external watchdog. This
-is deliberately the only queueing algorithm in AALP — both per-provider
-concurrency and per-flow admission (agent_protocols_v1_metadata_v1.md
-§24, §25) are built by instantiating this class with a different
-capacity, never by writing a second algorithm.
+its time-to-live lapses rather than needing an external watchdog.
+`gateway.py` instantiates exactly one `Lane` per active provider, sized
+to that provider's own `concurrency_limit` (see `registry.py`) — this
+class is not currently used for anything else. An earlier revision of
+this docstring described a second, per-flow admission use built by
+instantiating this class with a different capacity; that per-flow
+reservation was removed (see `interface/v1/README.md`'s "no renewal
+operation" note) and may not return without a new major version, so
+that description was vestigial and has been removed here too.
 
 This module knows nothing about providers, flows, or credentials —
 `holder` is an opaque caller-supplied string — so it satisfies the
 "AALP core contains no provider-specific branching" invariant (§22) by
-construction: any provider- or flow-specific meaning is applied entirely
-by the caller.
+construction: any provider-specific meaning is applied entirely by the
+caller.
 """
 from __future__ import annotations
 
