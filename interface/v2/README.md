@@ -339,6 +339,17 @@ after suspecting something is wrong, which is disproportionately likely to
 be exactly when a holder died badly). There is no honest number obtainable
 here at any precision, so v2 reports none.
 
+That reasoning alone would justify removal, but there is a second, harder
+fact that makes removal cheap rather than merely defensible: **`idle_seconds`
+has no consumer.** v1's `gateway.py` produces it and `lane.py` computes it,
+but nothing reads it outside AALP's own status output, AALP's own tests, and
+the fake-service fixture that exists only to satisfy this schema. ACP — the
+only cross-protocol client this interface exists for — never touches it, in
+any module. It is write-only telemetry: a value computed and reported to
+satisfy a contract, spent by no one. Keeping a field alive because it is
+*sometimes* exactly right only matters if something is reading it when it
+is; here, nothing is.
+
 `idle` survives this because it asks a strictly easier question: "is every
 slot free *right now*," answered completely by the same read-only probe
 `in_flight` already performs, with no history and no timestamp involved.
@@ -365,6 +376,16 @@ status probe, `utime`/mtime semantics differing between POSIX and Windows
 avoidable complexity), and any requirement that a probing process have write
 permission on state it is only trying to read. Dropping `idle_seconds` is
 what makes the probe this clean.
+
+**A note for whoever wires `provider.status` up to `FileLane`:** the current
+v1 code path this replaces, `aalp/gateway.py:651-661`, reads
+`lane_status["idle_seconds"]` from `Lane.status()` for an active provider
+and falls back to a hardcoded `idle_seconds = 0.0` for an inactive one (no
+`Lane` at all). That fallback is precisely the silent-wrong-value pattern
+this whole document exists to stop AALP from producing — a plausible-looking
+number standing in for "we don't actually know." When this code is rewritten
+against `FileLane`, the field must be dropped from the object entirely, not
+carried forward as a default of any kind, `0.0` included.
 
 ## Scheduling: concurrency ceiling, no ordering
 
