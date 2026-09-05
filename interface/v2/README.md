@@ -101,12 +101,12 @@ model (which builds directly on `aalp/file_lane.py` and
 `aalp/filelock_compat.py`, already-written and already-tested code), there
 is no CLI/stdin entrypoint anywhere in this repository today —
 `aalp/serve.py` only builds the socket-based `Ingress`, and `aalp/__main__.py`
-just calls `serve.main()`. The same caveat applies to the
-`admission_transition_record` mechanism `idle_seconds` depends on (see
-below): `aalp/file_lane.py` explicitly does not implement a `status()` of
-any kind and says as much in its own docstring. Both pieces need review
-against an actual implementation before anyone builds a client against them
-as if they were already load-bearing, tested behavior.
+just calls `serve.main()`. The same caveat applies to the `provider.status`
+read-only probe (`LOCK_SH|LOCK_NB` against each admission lock file,
+described below): `aalp/file_lane.py` explicitly does not implement a
+`status()` of any kind and says as much in its own docstring. Both pieces
+need review against an actual implementation before anyone builds a client
+against them as if they were already load-bearing, tested behavior.
 
 Interface v2 speaks JSON over a child process's own stdin/stdout, not a
 length-prefixed frame over `AF_UNIX`:
@@ -208,11 +208,9 @@ request envelope for the list form or present for the single form (`404` if
 unknown).
 
 Returns, per provider: `id`, `display_name`, `active`, `concurrency_limit`,
-`in_flight`, `idle`, `idle_seconds`, and `accepted_paths`. **`queued` is
-gone** — see "The forcing change: `queued` has no analog" below.
-**`idle_seconds` is now nullable** — see "`idle_seconds`: why it is
-nullable, not just approximate" below. Everything else here means what it
-meant in v1.
+`in_flight`, `idle`, and `accepted_paths`. **`queued` and `idle_seconds` are
+both gone** — see "The forcing changes: `queued` and `idle_seconds` have no
+analog" below. Everything else here means what it meant in v1.
 
 ### `request.forward`
 
@@ -267,7 +265,7 @@ before the deadline. A client that keys behavior only off the `outcome`
 string (as instructed in both versions) needs no code change here; a client
 that had baked in an assumption of *why* this outcome occurs does.
 
-## The forcing change: `queued` has no analog
+## The forcing changes: `queued` and `idle_seconds` have no analog
 
 v1's `queued` meant, verbatim, "requests currently waiting in this
 provider's FIFO lane." That sentence describes a concept — a FIFO lane with
@@ -285,9 +283,7 @@ provider's slots. A wrong non-zero number would be one kind of lie; a
 plausible-looking permanent zero is a worse one, because nothing about it
 signals "this value is meaningless" to a client reading it. **`queued` is
 removed outright.** This is the change that forced the version bump in the
-first place, and it is the only field with genuinely no replacement of any
-kind — every other v1 concept below has either a direct v2 successor or an
-explicit, justified removal.
+first place.
 
 `in_flight` and `idle` remain reportable, because — unlike "how many
 processes are currently waiting" — "is this specific slot currently held"
@@ -309,68 +305,66 @@ read under active contention can be stale by the time it's returned. v1's
 `Lane.status()` held one process-wide lock across its entire snapshot and
 was therefore atomic in a way this is not.
 
-### `idle_seconds`: why it is nullable, not just approximate
+### `idle_seconds` is also removed, and for a sharper reason than "approximate"
 
-`idle_seconds` cannot be derived from the admission lock files' own
-filesystem metadata — an earlier draft of this document said it could, and
-that was wrong: `flock()`/`msvcrt.locking()` touch no timestamp on a file
-whatsoever, on acquire, release, or in between. A lock file's mtime reflects
-only when it was first created and never moves again. Deriving `idle_seconds`
-from it would report time-since-file-creation, growing forever regardless of
-actual activity — a provider saturated with requests right now would read as
-having been idle for days.
+An earlier draft of this document tried to keep `idle_seconds`, first by
+claiming it could be read from the admission lock files' own filesystem
+metadata (wrong: `flock()`/`msvcrt.locking()` touch no timestamp on a file,
+ever — a lock file's mtime only reflects when it was first created), then,
+once that was caught, by making the field nullable and deriving it from a
+timestamp record a slot's holder would write deliberately on acquire and on
+release. Both attempts are gone. The owner's call, after reviewing the
+nullable design, was to drop `idle_seconds` outright, on the same grounds as
+`queued` — not keep a plain number with a caveat, and not keep a nullable
+field that returns a number most of the time and `null` only after a crash.
 
-The value has to come from a record someone deliberately writes. A slot's
-holder writes one, in `admission_transition_record.json`-shaped content
-attached to that slot (see `contract.json`'s `admission_transition_record`
-for the exact normative shape): `{"event": "acquired", "at": <wall-clock
-time>, "holder_pid": <pid>}` immediately after acquiring, overwritten with
-`{"event": "released", "at": <wall-clock time>}` immediately before a
-graceful release. Wall clock, not monotonic — a monotonic clock resets at
-reboot while these records are ordinary files that survive one untouched,
-so comparing a pre-reboot monotonic timestamp against a post-reboot reading
-would be meaningless. Any computation that would go negative (a backward
-NTP correction) is clamped to `0`, exactly as v1's own `Lane.status()`
-already did (`max(0.0, ...)`).
+**The specific reason a deliberately-written timestamp doesn't rescue this
+field:** any record of "this slot became free at T" has to be written by
+somebody, and the only somebody in a position to write it is the slot's own
+holder, on its way out. The entire reason this design uses OS locks in the
+first place is that they survive a holder being `SIGKILL`ed — the kernel
+releases the lock unconditionally on process death, running no code of the
+dead process's at all. That is exactly the moment a release-timestamp write
+needed to happen and exactly the moment nothing can make it happen. A probe
+reading that slot afterward sees "free" (true, and known instantly) with no
+honest record of *when* it became free — only that it did, somewhere between
+the last recorded acquire and now. Any number derived from that gap
+overstates idleness, in the unsafe direction: a caller using `idle` plus
+`idle_seconds` to infer safe dormancy would be told the provider has been
+quiet for longer than it actually has, by exactly the interval between the
+crash and whoever next happens to probe it. A nullable field only narrows
+*when* this shows up — it doesn't change that the crash case is the case
+the field exists to be useful for (a live client generally checks status
+after suspecting something is wrong, which is disproportionately likely to
+be exactly when a holder died badly). There is no honest number obtainable
+here at any precision, so v2 reports none.
 
-That deliberate-write design runs straight into the same crash-release
-property this whole daemonless design depends on elsewhere: a `SIGKILL`ed
-holder writes an `acquired` record and then never runs another line of code,
-including the `released` write. The OS still frees the lock instantly (that
-part is unaffected), but no record of *when* it freed exists. A probe reading
-that slot afterward sees "free" from the live lock check and "acquired at
-T0, never released" from the record — the slot has genuinely been free since
-some crash time between T0 and now, but not knowably since T0 itself.
-Reporting `now - T0` here would overstate idleness, in the specific
-unsafe direction: a caller deciding something is safely dormant from `idle`
-plus `idle_seconds` would be told it's been quiet for longer than it has.
+`idle` survives this because it asks a strictly easier question: "is every
+slot free *right now*," answered completely by the same read-only probe
+`in_flight` already performs, with no history and no timestamp involved.
+`idle_seconds` asks a question about the past — how long has it been this
+way — and answering that honestly requires a write that survives the one
+failure mode (an unclean death) this design most needs to tolerate. Those
+are different questions with different answerability, which is why one
+field is kept and the other isn't, rather than both living or dying
+together.
 
-Three options were on the table, and this is the actual decision, not a
-footnote: **(a)** keep a plain number always, with the crash-overstatement
-case documented as a caveat; **(b)** make the field nullable, returning
-`null` exactly when the true value can't be established; **(c)** drop the
-field outright, the way `queued` was dropped. **(a) is rejected** — it is
-the identical mistake `queued`'s permanent-zero option was rejected for: a
-plausible-looking number that is silently wrong is worse than an absent one,
-especially in the overstating direction. **(c) is rejected** — unlike
-`queued`, which has no ground truth in this design under any circumstance,
-`idle_seconds` has *exact* ground truth in the ordinary case: a graceful
-release always leaves an honest record. Dropping the field would discard
-real, verifiable data most of the time to guard against a case that only
-arises after an unclean death. **(b) is the decision**: `idle_seconds`
-stays in `provider_status_object.required` — the key is always present —
-but its value is `null` whenever the exact answer isn't known: a slot's
-last recorded holder crashed without releasing, or a slot has no transition
-record at all yet (which is *also* unknown-since, not "idle since AALP
-started" — v2 has no service-startup moment to measure from the way v1's
-`Lane.last_activity` did, so "never touched" is honestly `null`, not `0.0`).
-When every slot's free-since time is known, the provider-level value is the
-latest of them (the provider became fully idle at the moment its
-last-occupied slot freed); if even one slot's history is unknown, the
-provider-level value is `null` too — a lower bound isn't recoverable once
-any one slot's exact free-since time isn't. A client must check for `null`
-before using this field, the same discipline this contract already requires
-for `outcome` over status code.
+**A genuine simplification falls out of this, not just a subtraction: with
+no timestamp to record, nothing in interface v2 ever needs to write to an
+admission lock file.** No `utime` on acquire, none on release, no write of
+any kind by anything other than the OS's own lock-state bookkeeping. The
+lock files become pure lock tokens whose only meaningful state is
+held-or-free — content-free, in fact, since nothing is ever written into
+them — and the status probe (`in_flight`/`idle`) becomes strictly read-only:
+it cannot mutate what it observes, on a free slot or a held one. That
+removes an entire category of design questions a write-on-transition scheme
+would have introduced: write races between a slot's holder and a concurrent
+status probe, `utime`/mtime semantics differing between POSIX and Windows
+(this repo already carries one POSIX/Windows split in
+`aalp/filelock_compat.py`; a second one for timestamp writes would have been
+avoidable complexity), and any requirement that a probing process have write
+permission on state it is only trying to read. Dropping `idle_seconds` is
+what makes the probe this clean.
 
 ## Scheduling: concurrency ceiling, no ordering
 
@@ -474,8 +468,8 @@ change a v1 client can ignore:
 | Length-prefixed JSON frame over `AF_UNIX` | JSON on stdin, JSON on stdout, one process per call | Replace the socket client entirely |
 | `Authorization: Bearer <secret>` on every call | None — OS process identity + filesystem permissions | Remove secret-reading and header-injection code |
 | `provider_id` folded into the request `path` string | `provider_id` a separate top-level field | Stop concatenating provider id into a path |
-| `provider.status` response includes `queued` | `queued` removed, no replacement | Remove any code that reads `queued`; do not substitute a hardcoded `0` |
-| `idle_seconds` is always a plain number | `idle_seconds` is nullable; `null` means the exact value can't be established (a crashed holder, or no history yet) | Add a null check before using `idle_seconds`; do not treat `null` as `0` or skip the check |
+| `provider.status` response includes `queued` | `queued` removed, no replacement (first removed field) | Remove any code that reads `queued`; do not substitute a hardcoded `0` |
+| `provider.status` response includes `idle_seconds` | `idle_seconds` removed, no replacement (second removed field, same grounds as `queued`) | Remove any code that reads `idle_seconds`; there is no v2 equivalent to migrate to — redesign that dependency out, the same treatment FIFO ordering below gets |
 | `queue_timeout` means "FIFO lane admission timed out" | `queue_timeout` means "concurrency-slot admission timed out"; same name, same status code | No code change if the client only keys off the `outcome` string (as it always should have); update any comments/docs asserting FIFO |
 | Submitted-request FIFO ordering guaranteed per provider | No ordering guarantee among waiters for the same provider | Remove any correctness dependency on submission order; a throughput-only dependency needs no change |
 | `request.queue` + `X-Aalp-Queue-*` headers coalesce concurrent identical requests | Operation removed; the headers do nothing | Submit each request independently via `request.forward`; remove coalescing-dependent logic |
