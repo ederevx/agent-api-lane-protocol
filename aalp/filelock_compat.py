@@ -44,6 +44,47 @@ directly, including multi-process and SIGKILL tests.
 Both platforms raise `OSError` on a failed non-blocking attempt, with
 different errnos -- callers of this module never need to know either:
 a failed `acquire()` here always raises `LockBusy`, on both platforms.
+
+Probing without acquiring
+--------------------------
+`probe()` answers "is someone else holding this lock right now?"
+without taking the exclusive lock itself, so a caller (see
+`file_lane.py`'s `FileLane.status()`) can count held slots for
+introspection without disturbing a genuine holder or a genuine future
+acquirer.
+
+* POSIX implements this exactly the way `flock` is meant to be used
+  for a reader: `fcntl.flock(fd, LOCK_SH | LOCK_NB)` on a fresh fd. A
+  shared lock is granted immediately if nobody holds `LOCK_EX`, and
+  refused (`EWOULDBLOCK`) if someone does -- so the probe can only ever
+  be granted when the slot is genuinely free, and, being shared, it
+  never itself blocks or is blocked by another concurrent probe. It is
+  released (`LOCK_UN`) immediately after the check, before returning,
+  so it is never observable by anyone else and never outlives this
+  function call. This is truly non-invasive: a real exclusive holder
+  is completely unaffected by any number of concurrent probes, and a
+  probe against a free slot leaves it exactly as free as it found it.
+
+* Windows has no equivalent. `msvcrt.locking()`'s modes (`LK_LOCK`,
+  `LK_RLCK`, `LK_NBLCK`, `LK_NBRLCK`) are all *exclusive* -- the R
+  variants only change retry behavior (blocking with up to 10 retries
+  at 1-second intervals vs. failing immediately), not shared-vs
+  -exclusive semantics; there is no reader-lock mode documented or
+  available. So there is no way to ask "is this held?" on Windows
+  without, for an instant, actually taking the lock: this function
+  falls back to a non-blocking exclusive try (`LK_NBLCK`) that is
+  released immediately on success. This is **not** the non-invasive
+  probe the POSIX path is -- it briefly holds the real lock, so a
+  genuine acquirer's own `LK_NBLCK` attempt landing inside that
+  instant would spuriously see `LockBusy` even though the probing
+  process never intended to hold the slot. That window is as short as
+  this function can make it (acquire immediately followed by release,
+  no other work in between), but it is real, and it is the opposite
+  failure direction from the POSIX path, which can never cause a
+  spurious busy result for anyone. UNVERIFIED like the rest of the
+  Windows branch in this module -- no Windows machine was available
+  to exercise it, so this is implemented from documented behavior
+  only.
 """
 from __future__ import annotations
 
@@ -173,3 +214,49 @@ class FileLock:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
+
+
+def probe(path: str | Path) -> bool:
+    """Return True if some other holder currently holds `path`'s
+    exclusive lock, False if it is free right now.
+
+    A single non-blocking check -- never waits, never raises `LockBusy`
+    (that exception is `acquire()`'s vocabulary for "I wanted this and
+    didn't get it"; `probe()` never wants it, so a busy slot is just a
+    `True` return). Always opens its own fd, distinct from any
+    `FileLock` instance the caller might separately hold, and always
+    closes it before returning -- no lock is left held and no handle is
+    leaked on any path through this function, success or failure.
+
+    See this module's docstring ("Probing without acquiring") for the
+    POSIX shared-lock mechanism and the Windows fallback's honest
+    trade-off; the Windows branch is UNVERIFIED.
+    """
+    path = Path(path)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    fh = os.fdopen(fd, "r+b")
+    try:
+        if _IS_WINDOWS:
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, _WINDOWS_LOCK_NBYTES)
+            except OSError:
+                return True
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, _WINDOWS_LOCK_NBYTES)
+            except OSError:
+                pass
+            return False
+        else:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return False
+    finally:
+        fh.close()

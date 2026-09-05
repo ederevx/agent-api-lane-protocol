@@ -67,6 +67,37 @@ def _acquire_and_report_time(directory, provider_id, capacity, timeout_seconds,
     result_queue.put(("acquired", time.time()))
 
 
+def _acquire_and_hang_forever(directory, provider_id, capacity, acquired_event):
+    """Acquire and hang until killed -- never releases on its own,
+    unlike `_acquire_signal_and_hang`'s bounded sleep."""
+    lane = FileLane(provider_id, capacity, directory=Path(directory))
+    # Keep the lease referenced: FileLease holds the FileLock, and the
+    # FileLock holds the open fd that the flock actually lives on --
+    # letting the lease get garbage-collected would close that fd and
+    # release the lock immediately, before this process ever hangs.
+    lease = lane.acquire(timeout_seconds=5)  # noqa: F841
+    acquired_event.set()
+    while True:
+        time.sleep(1.0)
+
+
+def _acquire_do_work_and_release(directory, provider_id, capacity, acquired_event,
+                                  counter, iterations, sleep_seconds, done_event):
+    """Acquire a slot, then do visible ongoing "work" (incrementing a
+    shared counter in a loop with short sleeps) before releasing. Used
+    to prove FileLane.status()'s probing does not disturb a real
+    holder."""
+    lane = FileLane(provider_id, capacity, directory=Path(directory))
+    lease = lane.acquire(timeout_seconds=5)
+    acquired_event.set()
+    for _ in range(iterations):
+        with counter.get_lock():
+            counter.value += 1
+        time.sleep(sleep_seconds)
+    lease.release()
+    done_event.set()
+
+
 class FileLaneMutualExclusionTest(unittest.TestCase):
     def test_two_processes_capacity_one_never_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +336,155 @@ class FileLaneConstructionAndLeaseTest(unittest.TestCase):
             # immediately.
             other = FileLane("ci", 1, directory=Path(tmp))
             other.acquire(timeout_seconds=0).release()
+
+
+class FileLaneStatusTest(unittest.TestCase):
+    def _poll_until(self, predicate, timeout=5.0, interval=0.05):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = predicate()
+            if last:
+                return last
+            time.sleep(interval)
+        self.fail(f"condition never became true; last value: {last!r}")
+
+    def test_fresh_lane_reports_zero_in_flight_and_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lane = FileLane("ci", 3, directory=Path(tmp))
+            status = lane.status()
+            self.assertEqual(status["capacity"], 3)
+            self.assertEqual(status["in_flight"], 0)
+            self.assertTrue(status["idle"])
+
+    def test_partial_occupancy_reports_correct_in_flight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lane = FileLane("ci", 3, directory=Path(tmp))
+            acquired_event = _CTX.Event()
+            holder = _CTX.Process(
+                target=_acquire_signal_and_hang,
+                args=(tmp, "ci", 3, acquired_event, 30.0),
+            )
+            holder.start()
+            self.addCleanup(lambda: (holder.terminate(), holder.join(timeout=2)))
+            self.assertTrue(acquired_event.wait(timeout=5))
+
+            status = lane.status()
+            self.assertEqual(status["in_flight"], 1)
+            self.assertFalse(status["idle"])
+
+            os.kill(holder.pid, signal.SIGKILL)
+            holder.join(timeout=5)
+            self.assertFalse(holder.is_alive())
+
+            self._poll_until(lambda: lane.status()["in_flight"] == 0)
+
+    def test_full_occupancy_reports_capacity_in_flight(self) -> None:
+        capacity = 3
+        with tempfile.TemporaryDirectory() as tmp:
+            lane = FileLane("ci", capacity, directory=Path(tmp))
+            events = [_CTX.Event() for _ in range(capacity)]
+            holders = [
+                _CTX.Process(
+                    target=_acquire_signal_and_hang,
+                    args=(tmp, "ci", capacity, events[i], 30.0),
+                )
+                for i in range(capacity)
+            ]
+            for h in holders:
+                h.start()
+            self.addCleanup(
+                lambda: [(h.terminate(), h.join(timeout=2)) for h in holders])
+            for e in events:
+                self.assertTrue(e.wait(timeout=5))
+
+            status = lane.status()
+            self.assertEqual(status["in_flight"], capacity)
+            self.assertFalse(status["idle"])
+
+    def test_status_probing_does_not_disturb_a_real_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lane = FileLane("ci", 2, directory=Path(tmp))
+            acquired_event = _CTX.Event()
+            done_event = _CTX.Event()
+            counter = _CTX.Value("i", 0)
+            iterations = 20
+            sleep_seconds = 0.05  # ~1 second of total "work"
+
+            holder = _CTX.Process(
+                target=_acquire_do_work_and_release,
+                args=(tmp, "ci", 2, acquired_event, counter, iterations,
+                      sleep_seconds, done_event),
+            )
+            holder.start()
+            self.addCleanup(lambda: (holder.terminate(), holder.join(timeout=2)))
+            self.assertTrue(acquired_event.wait(timeout=5))
+
+            deadline = time.time() + (iterations * sleep_seconds) + 1.0
+            status_count = 0
+            while not done_event.is_set() and time.time() < deadline:
+                status = lane.status()
+                self.assertGreaterEqual(status["in_flight"], 1)
+                status_count += 1
+                time.sleep(0.01)
+            self.assertGreater(status_count, 0, "status loop never actually ran")
+
+            holder.join(timeout=5)
+            self.assertFalse(holder.is_alive())
+            self.assertEqual(counter.value, iterations)
+
+    def test_in_flight_drops_after_sigkill_and_idle_seconds_is_sane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lane = FileLane("ci", 1, directory=Path(tmp))
+            acquired_event = _CTX.Event()
+            holder = _CTX.Process(
+                target=_acquire_and_hang_forever,
+                args=(tmp, "ci", 1, acquired_event),
+            )
+            holder.start()
+            self.addCleanup(lambda: (holder.terminate(), holder.join(timeout=2)))
+            self.assertTrue(acquired_event.wait(timeout=5))
+
+            self.assertEqual(lane.status()["in_flight"], 1)
+
+            os.kill(holder.pid, signal.SIGKILL)
+            holder.join(timeout=5)
+            self.assertFalse(holder.is_alive())
+
+            status = self._poll_until(
+                lambda: (lambda s: s if s["in_flight"] == 0 else None)(lane.status()))
+            self.assertTrue(status["idle"])
+            # Per FileLane.status()'s documented limitation, idle_seconds
+            # after a crashed (SIGKILLed, not cleanly released) holder
+            # can overstate true idle time by roughly that hold's own
+            # duration, because nothing observes the actual moment of
+            # death -- this is a known, accepted approximation, not a
+            # bug. So only assert this is a sane, non-negative float,
+            # never a tight bound on its exact value.
+            idle_seconds = status["idle_seconds"]
+            self.assertIsInstance(idle_seconds, float)
+            self.assertGreaterEqual(idle_seconds, 0.0)
+
+    def test_idle_seconds_behaves_sanely_on_clean_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lane = FileLane("ci", 1, directory=Path(tmp))
+            status = lane.status()
+            self.assertLess(status["idle_seconds"], 2.0)
+            self.assertTrue(lane.activity_path.exists())
+
+            lease = lane.acquire(timeout_seconds=1)
+            lease.release()
+            status = lane.status()
+            # Reset by the release-time touch -- still small.
+            self.assertLess(status["idle_seconds"], 2.0)
+
+            time.sleep(0.3)
+            status_after = lane.status()
+            # Generous, non-flaky bounds around the ~0.3s that elapsed,
+            # matching the tolerance style used by
+            # test_acquire_times_out_cleanly_without_hanging above.
+            self.assertGreaterEqual(status_after["idle_seconds"], 0.2)
+            self.assertLess(status_after["idle_seconds"], 2.0)
 
 
 if __name__ == "__main__":
