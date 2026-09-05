@@ -93,6 +93,21 @@ on its own, sufficient reason for a new major interface version.
 
 ## Wire protocol: a CLI, not a socket
 
+**Status note, kept prominent deliberately:** everything in this section —
+the invocation form, the stdin/stdout envelopes, the exit codes — is new
+design produced for this document, not a transcription of something already
+implemented and exercised. Unlike, say, `provider.status`'s admission
+model (which builds directly on `aalp/file_lane.py` and
+`aalp/filelock_compat.py`, already-written and already-tested code), there
+is no CLI/stdin entrypoint anywhere in this repository today —
+`aalp/serve.py` only builds the socket-based `Ingress`, and `aalp/__main__.py`
+just calls `serve.main()`. The same caveat applies to the
+`admission_transition_record` mechanism `idle_seconds` depends on (see
+below): `aalp/file_lane.py` explicitly does not implement a `status()` of
+any kind and says as much in its own docstring. Both pieces need review
+against an actual implementation before anyone builds a client against them
+as if they were already load-bearing, tested behavior.
+
 Interface v2 speaks JSON over a child process's own stdin/stdout, not a
 length-prefixed frame over `AF_UNIX`:
 
@@ -117,6 +132,17 @@ response: {"status": int, "headers": {str: str}, "body": <base64 str>}
 `status` and `headers`/`X-Aalp-Outcome` mean exactly what they meant in v1 —
 only the transport underneath changed. `body` is still base64-encoded so it
 can carry arbitrary, non-UTF8-safe passthrough bytes safely inside JSON.
+
+**Closing stdin after writing the request is a client obligation, stated
+here as a hard requirement, not left to be inferred.** The child's read loop
+blocks until stdin reaches EOF; from inside that loop, "the client has more
+to write" and "the client is never going to close this" look identical.
+A client that writes the envelope and leaves its end of stdin open hangs the
+child indefinitely, with nothing the child itself can do to detect or
+recover from it. A client-side timeout on how long it waits for the child to
+exit (see "Exit codes" below) limits the damage from getting this wrong, but
+does not substitute for it — a conforming client **must** close stdin
+immediately after writing the complete request envelope.
 
 ### Nothing sensitive travels in argv — a hard invariant
 
@@ -183,8 +209,10 @@ unknown).
 
 Returns, per provider: `id`, `display_name`, `active`, `concurrency_limit`,
 `in_flight`, `idle`, `idle_seconds`, and `accepted_paths`. **`queued` is
-gone** — see "The forcing change: `queued` has no analog" below. Everything
-else here means what it meant in v1.
+gone** — see "The forcing change: `queued` has no analog" below.
+**`idle_seconds` is now nullable** — see "`idle_seconds`: why it is
+nullable, not just approximate" below. Everything else here means what it
+meant in v1.
 
 ### `request.forward`
 
@@ -279,12 +307,70 @@ read: each of the `concurrency_limit` slots is probed one at a time, with no
 single moment at which all of them are observed simultaneously, so a value
 read under active contention can be stale by the time it's returned. v1's
 `Lane.status()` held one process-wide lock across its entire snapshot and
-was therefore atomic in a way this is not. `idle_seconds` — seconds since
-this provider's admission state last changed — is derived from the same
-lock files' own modification times rather than an in-process timestamp
-(there is no resident process left to hold one in memory), and carries the
-same non-atomicity caveat. A cold provider with no admission activity yet
-reports `0.0`, matching v1's cold-start behavior.
+was therefore atomic in a way this is not.
+
+### `idle_seconds`: why it is nullable, not just approximate
+
+`idle_seconds` cannot be derived from the admission lock files' own
+filesystem metadata — an earlier draft of this document said it could, and
+that was wrong: `flock()`/`msvcrt.locking()` touch no timestamp on a file
+whatsoever, on acquire, release, or in between. A lock file's mtime reflects
+only when it was first created and never moves again. Deriving `idle_seconds`
+from it would report time-since-file-creation, growing forever regardless of
+actual activity — a provider saturated with requests right now would read as
+having been idle for days.
+
+The value has to come from a record someone deliberately writes. A slot's
+holder writes one, in `admission_transition_record.json`-shaped content
+attached to that slot (see `contract.json`'s `admission_transition_record`
+for the exact normative shape): `{"event": "acquired", "at": <wall-clock
+time>, "holder_pid": <pid>}` immediately after acquiring, overwritten with
+`{"event": "released", "at": <wall-clock time>}` immediately before a
+graceful release. Wall clock, not monotonic — a monotonic clock resets at
+reboot while these records are ordinary files that survive one untouched,
+so comparing a pre-reboot monotonic timestamp against a post-reboot reading
+would be meaningless. Any computation that would go negative (a backward
+NTP correction) is clamped to `0`, exactly as v1's own `Lane.status()`
+already did (`max(0.0, ...)`).
+
+That deliberate-write design runs straight into the same crash-release
+property this whole daemonless design depends on elsewhere: a `SIGKILL`ed
+holder writes an `acquired` record and then never runs another line of code,
+including the `released` write. The OS still frees the lock instantly (that
+part is unaffected), but no record of *when* it freed exists. A probe reading
+that slot afterward sees "free" from the live lock check and "acquired at
+T0, never released" from the record — the slot has genuinely been free since
+some crash time between T0 and now, but not knowably since T0 itself.
+Reporting `now - T0` here would overstate idleness, in the specific
+unsafe direction: a caller deciding something is safely dormant from `idle`
+plus `idle_seconds` would be told it's been quiet for longer than it has.
+
+Three options were on the table, and this is the actual decision, not a
+footnote: **(a)** keep a plain number always, with the crash-overstatement
+case documented as a caveat; **(b)** make the field nullable, returning
+`null` exactly when the true value can't be established; **(c)** drop the
+field outright, the way `queued` was dropped. **(a) is rejected** — it is
+the identical mistake `queued`'s permanent-zero option was rejected for: a
+plausible-looking number that is silently wrong is worse than an absent one,
+especially in the overstating direction. **(c) is rejected** — unlike
+`queued`, which has no ground truth in this design under any circumstance,
+`idle_seconds` has *exact* ground truth in the ordinary case: a graceful
+release always leaves an honest record. Dropping the field would discard
+real, verifiable data most of the time to guard against a case that only
+arises after an unclean death. **(b) is the decision**: `idle_seconds`
+stays in `provider_status_object.required` — the key is always present —
+but its value is `null` whenever the exact answer isn't known: a slot's
+last recorded holder crashed without releasing, or a slot has no transition
+record at all yet (which is *also* unknown-since, not "idle since AALP
+started" — v2 has no service-startup moment to measure from the way v1's
+`Lane.last_activity` did, so "never touched" is honestly `null`, not `0.0`).
+When every slot's free-since time is known, the provider-level value is the
+latest of them (the provider became fully idle at the moment its
+last-occupied slot freed); if even one slot's history is unknown, the
+provider-level value is `null` too — a lower bound isn't recoverable once
+any one slot's exact free-since time isn't. A client must check for `null`
+before using this field, the same discipline this contract already requires
+for `outcome` over status code.
 
 ## Scheduling: concurrency ceiling, no ordering
 
@@ -389,6 +475,7 @@ change a v1 client can ignore:
 | `Authorization: Bearer <secret>` on every call | None — OS process identity + filesystem permissions | Remove secret-reading and header-injection code |
 | `provider_id` folded into the request `path` string | `provider_id` a separate top-level field | Stop concatenating provider id into a path |
 | `provider.status` response includes `queued` | `queued` removed, no replacement | Remove any code that reads `queued`; do not substitute a hardcoded `0` |
+| `idle_seconds` is always a plain number | `idle_seconds` is nullable; `null` means the exact value can't be established (a crashed holder, or no history yet) | Add a null check before using `idle_seconds`; do not treat `null` as `0` or skip the check |
 | `queue_timeout` means "FIFO lane admission timed out" | `queue_timeout` means "concurrency-slot admission timed out"; same name, same status code | No code change if the client only keys off the `outcome` string (as it always should have); update any comments/docs asserting FIFO |
 | Submitted-request FIFO ordering guaranteed per provider | No ordering guarantee among waiters for the same provider | Remove any correctness dependency on submission order; a throughput-only dependency needs no change |
 | `request.queue` + `X-Aalp-Queue-*` headers coalesce concurrent identical requests | Operation removed; the headers do nothing | Submit each request independently via `request.forward`; remove coalescing-dependent logic |
