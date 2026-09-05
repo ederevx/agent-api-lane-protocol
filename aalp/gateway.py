@@ -57,11 +57,28 @@ from .queue import (
 )
 from .registry import ProviderDefinition
 
-# §22's primary Stage 3 bound: a generation seals once it holds this many
-# members, whether or not the provider is still occupied. The byte/output-
-# budget bounds §22 also describes are deliberately deferred -- member
-# count is the only one with an unambiguous, payload-blind measurement.
-_DEFAULT_MAX_QUEUE_MEMBERS = 4
+# §22's bound: a generation seals once its members' combined input size
+# reaches this many bytes, whether or not the provider is still occupied.
+# Queue width is deliberately not additionally capped by a fixed member
+# count -- a hardcoded count is blind to how large each member actually
+# is, so it either wastes headroom on small payloads or admits a
+# combination that blows past `compression_timeout` on large ones. Bytes
+# (the UTF-8 length of each member's own `member_block`) stand in for a
+# token count here: AALP's admission path is deliberately payload-blind
+# (it never parses `member_block`'s contents, just measures it), and a
+# real tokenizer would be a strange dependency for a gateway that isn't
+# supposed to know anything about the model on the other end.
+#
+# Derived from live benchmarking against the real `ci` backend
+# (agent_protocols_v1/STATUS.md, queue-coalescing sections): combined
+# widths up to 280,000 bytes (2 members at ~140,000 bytes each, or 4
+# members at up to 70,000 bytes each) completed reliably well under
+# `compression_timeout`, while 4 members at ~140,000 bytes each (560,000
+# combined) reliably ran past even a loosened 60s ceiling. 280,000 sits at
+# the top of the confirmed-safe range. A starting point from a small
+# sample, not a precisely derived formula -- revisit with more data if
+# traffic patterns change.
+_DEFAULT_MAX_QUEUE_INPUT_BYTES = 280_000
 
 _STATUS_BY_OUTCOME: dict[Outcome, int] = {
     Outcome.UNAVAILABLE: 503,
@@ -125,11 +142,19 @@ class _QueueSlot:
     `result` are concurrency plumbing, not part of the generation's own
     state machine. The leader (the thread that created this slot) drives
     `generation` to DONE and publishes `result` here exactly once; every
-    joiner blocks on `done_event` and then reads `result`."""
+    joiner blocks on `done_event` and then reads `result`.
+
+    `total_member_bytes` is the running sum of each member's own
+    `member_block` size (UTF-8 encoded), tracked here rather than on
+    `QueueGeneration` for the same reason as `done_event`/`result` --
+    it is an admission-bookkeeping concern of this gateway's
+    `max_queue_input_bytes` bound (§22), not part of the generation's
+    own structure-blind state machine."""
 
     generation: QueueGeneration
     done_event: threading.Event = field(default_factory=threading.Event)
     result: AalpResult | None = None
+    total_member_bytes: int = 0
 
 
 class Gateway:
@@ -143,15 +168,15 @@ class Gateway:
         clock: Callable[[], float] = time.monotonic,
         lease_seconds: float = 30.0,
         connection_factory: forwarder.ConnectionFactory | None = None,
-        max_queue_members: int | None = None,
+        max_queue_input_bytes: int | None = None,
     ) -> None:
         self.providers_dir = providers_dir
         self.root = root
         self.clock = clock
         self.lease_seconds = lease_seconds
         self.connection_factory = connection_factory
-        self.max_queue_members = max_queue_members or int(
-            os.environ.get("AALP_MAX_QUEUE_MEMBERS", _DEFAULT_MAX_QUEUE_MEMBERS))
+        self.max_queue_input_bytes = max_queue_input_bytes or int(
+            os.environ.get("AALP_MAX_QUEUE_INPUT_BYTES", _DEFAULT_MAX_QUEUE_INPUT_BYTES))
 
         self.providers = registry.load_providers(providers_dir)
         self.provider_lanes: dict[str, Lane] = {
@@ -575,6 +600,7 @@ class Gateway:
                 provider_id, queue_key, flow_id, path, start, result)
 
         member = QueueMember(member_id=member_id, payload=payload)
+        member_bytes = len(str(payload.get("member_block") or "").encode("utf-8"))
         slot_key = (provider_id, queue_key)
         is_leader = False
         with self._queue_lock:
@@ -586,22 +612,23 @@ class Gateway:
                     queue_key=queue_key,
                 )
                 generation.append(member)
-                slot = _QueueSlot(generation=generation)
+                slot = _QueueSlot(generation=generation, total_member_bytes=member_bytes)
                 is_leader = True
-                # §22: a generation seals as soon as it holds
-                # max_queue_members, even if that happens on its very
-                # first (leader) member -- max_queue_members=1 must mean
-                # every member gets its own singleton generation, never
-                # silently waiting for a joiner that would push it over
-                # the configured bound. Only register the slot as OPEN
-                # (joinable) if it is genuinely still under the cap.
-                if generation.member_count >= self.max_queue_members:
+                # §22: a generation seals as soon as its members' combined
+                # input size reaches max_queue_input_bytes, even if that
+                # happens on its very first (leader) member -- a single
+                # oversized member must seal its own singleton generation
+                # immediately, never silently waiting for a joiner that
+                # would push it further over budget. Only register the slot
+                # as OPEN (joinable) if it is genuinely still under budget.
+                if slot.total_member_bytes >= self.max_queue_input_bytes:
                     generation.seal()
                 else:
                     self._open_queue_slots[slot_key] = slot
             else:
                 slot.generation.append(member)
-                if slot.generation.member_count >= self.max_queue_members:
+                slot.total_member_bytes += member_bytes
+                if slot.total_member_bytes >= self.max_queue_input_bytes:
                     slot.generation.seal()
                     del self._open_queue_slots[slot_key]
 

@@ -644,11 +644,17 @@ class ConformanceMixin:
         self.assertEqual(results["B"][0], 200)
 
     def test_queue_member_bound_seals_generation_and_opens_a_new_one(self) -> None:
-        # §22-§23: a generation seals once it holds max_queue_members
-        # (this fixture's own gateway/service default is 4) even though
-        # the provider is still occupied -- further arrivals for the same
-        # queue_key open a second, later generation instead of growing
-        # the first without bound.
+        # §22-§23: a generation seals once its members' combined input size
+        # reaches max_queue_input_bytes (this fixture's own gateway/service
+        # default is 280,000 bytes) even though the provider is still
+        # occupied -- further arrivals for the same queue_key open a
+        # second, later generation instead of growing the first without
+        # bound. Queue width has no separate fixed member-count cap -- it
+        # is driven by this byte accounting alone -- so each member's own
+        # `member_block` is sized to exactly 70,000 bytes here: the first
+        # four members' combined size lands exactly on the 280,000-byte
+        # bound (sealing after D), while the third's combined 210,000
+        # stays under it (proving the seal isn't premature).
         self.driver.set_providers([
             {"id": "prov", "display_name": "Prov", "concurrency_limit": 1,
              "accepted_paths": ["/v1/messages"]},
@@ -670,9 +676,9 @@ class ConformanceMixin:
         def submit(marker: str) -> None:
             results[marker] = self.driver.submit_queue_member(
                 "prov", "shared-key", "POST", "/v1/messages",
-                body=self._queue_envelope(f"block-{marker}"), flow_id=f"flow-{marker}")
+                body=self._queue_envelope(marker * 70_000), flow_id=f"flow-{marker}")
 
-        markers = ["A", "B", "C", "D", "E"]  # 4 = default max_queue_members
+        markers = ["A", "B", "C", "D", "E"]  # 4 * 70,000 bytes == the 280,000-byte bound
         threads = [threading.Thread(target=submit, args=(marker,)) for marker in markers]
         for thread in threads:
             thread.start()

@@ -14,8 +14,12 @@ approximately `generation_count * latency` -- this is what lets width
 actually show up as a measurable wall-clock improvement here, not just a
 call-count one.
 
-`max_queue_members` is a `Gateway` constructor parameter
-(`AALP_MAX_QUEUE_MEMBERS` env var otherwise, default 4) -- provider files
+Queue width has no separate fixed member-count cap -- it is driven purely
+by `max_queue_input_bytes` (a `Gateway` constructor parameter,
+`AALP_MAX_QUEUE_INPUT_BYTES` env var otherwise). Every backlog member's
+`member_block` here is the same fixed size (`_MEMBER_BLOCK_BYTES`), so a
+given width is forced deterministically by setting
+`max_queue_input_bytes = width * _MEMBER_BLOCK_BYTES` -- provider files
 themselves don't change between widths, so all three benchmark runs reuse
 the same `providers_dir`/credential and just construct a fresh `Gateway`
 per width.
@@ -62,6 +66,12 @@ def _write_provider(providers_dir: Path, provider_id: str, **overrides) -> None:
     data.update(overrides)
     (providers_dir / f"{provider_id}.json").write_text(
         json.dumps(data), encoding="utf-8")
+
+
+# Every backlog member's own member_block is forced to exactly this many
+# bytes, so a desired width can be forced deterministically by setting
+# max_queue_input_bytes = width * _MEMBER_BLOCK_BYTES (see module docstring).
+_MEMBER_BLOCK_BYTES = 1_000
 
 
 def _queue_envelope(member_block: str = "member-block") -> bytes:
@@ -178,7 +188,8 @@ class QueueBenchmarkTest(unittest.TestCase):
 
         gateway = Gateway(
             self.providers_dir, root=self.root,
-            connection_factory=connection_factory, max_queue_members=width)
+            connection_factory=connection_factory,
+            max_queue_input_bytes=width * _MEMBER_BLOCK_BYTES)
 
         def occupy() -> None:
             gateway.handle("occupier", "prov", "POST", "/v1/messages", {}, b"{}")
@@ -193,7 +204,8 @@ class QueueBenchmarkTest(unittest.TestCase):
         def submit(marker: str) -> None:
             results[marker] = gateway.handle_queue(
                 f"flow-{marker}", "prov", "shared-key", f"member-{marker}",
-                "POST", "/v1/messages", {}, _queue_envelope(f"{marker}-block"))
+                "POST", "/v1/messages", {},
+                _queue_envelope(marker * _MEMBER_BLOCK_BYTES))
 
         markers = [str(i) for i in range(self._BACKLOG_SIZE)]
         threads = [threading.Thread(target=submit, args=(marker,)) for marker in markers]

@@ -174,6 +174,7 @@ class _QueueSlot:
     members: list[dict] = field(default_factory=list)
     done_event: threading.Event = field(default_factory=threading.Event)
     result: QueueForwardResult | None = None
+    total_member_bytes: int = 0
 
 
 class _ProviderLane:
@@ -231,14 +232,16 @@ class FakeAalpV1Service:
     """In-process core: capabilities, provider.status, request.forward."""
 
     def __init__(
-        self, providers: list[FakeProviderConfig] | None = None, max_queue_members: int = 4
+        self,
+        providers: list[FakeProviderConfig] | None = None,
+        max_queue_input_bytes: int = 280_000,
     ) -> None:
         self._lock = threading.RLock()
         self._providers: dict[str, FakeProviderConfig] = {}
         self._lanes: dict[str, _ProviderLane] = {}
         self._programmed: dict[tuple[str, str], deque[ProgrammedResponse]] = {}
         self._maintenance = False
-        self.max_queue_members = max_queue_members
+        self.max_queue_input_bytes = max_queue_input_bytes
         self._open_queue_slots: dict[tuple[str, str], _QueueSlot] = {}
         if providers:
             self.set_providers(providers)
@@ -404,6 +407,7 @@ class FakeAalpV1Service:
                 outcome=result.outcome, status=result.status, headers=out_headers,
                 body=result.body, generation_id=generation_id, member_count=0)
 
+        member_bytes = len(str(payload.get("member_block") or "").encode("utf-8"))
         slot_key = (provider_id, queue_key)
         is_leader = False
         with self._lock:
@@ -413,7 +417,8 @@ class FakeAalpV1Service:
                 self._open_queue_slots[slot_key] = slot
                 is_leader = True
             slot.members.append(payload)
-            if len(slot.members) >= self.max_queue_members:
+            slot.total_member_bytes += member_bytes
+            if slot.total_member_bytes >= self.max_queue_input_bytes:
                 self._open_queue_slots.pop(slot_key, None)
 
         if is_leader:
